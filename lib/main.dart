@@ -1,10 +1,12 @@
+// lib/main.dart
+import 'dart:async';
 import 'dart:math' as math;
+import 'yolo.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
-// ==== 英語ラベル → 日本語表示名 ====
 const Map<String, String> kJaName = {
   'stop': '一時停止',
   'yield': 'ゆずれ',
@@ -29,7 +31,6 @@ const Map<String, String> kJaName = {
   'parking': '駐車可',
 };
 
-// ==== 英語ラベル → 意味 ====
 const Map<String, String> kMeaning = {
   'stop': 'ここで必ず一時停止してください。',
   'yield': '対向・優先車に道を譲ってください。',
@@ -56,27 +57,106 @@ const Map<String, String> kMeaning = {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
-  // 横画面固定
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
   ]);
 
-  final cameras = await availableCameras();
-  runApp(_App(cameras: cameras));
+  runApp(const _App());
 }
 
 class _App extends StatelessWidget {
-  final List<CameraDescription> cameras;
-  const _App({super.key, required this.cameras});
+  const _App({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: _Entry(),
+    );
+  }
+}
+
+/// まずはプレースホルダーを表示してからカメラを取る
+class _Entry extends StatefulWidget {
+  const _Entry({super.key});
+  @override
+  State<_Entry> createState() => _EntryState();
+}
+
+class _EntryState extends State<_Entry> {
+  List<CameraDescription>? _cams;
+  String? _error;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadCameras();
+  }
+
+  Future<void> _loadCameras() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      // ✅ タイムアウトをかけて固まりを回避
+      final cams = await Future.any<List<CameraDescription>>([
+        availableCameras(),
+        Future<List<CameraDescription>>.delayed(
+          const Duration(seconds: 6),
+          () => throw TimeoutException('availableCameras timeout'),
+        ),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _cams = cams;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _loading = false;
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      home: _CameraOverlayPage(cameras: cameras),
-    );
+    // シンプルなプレースホルダー
+    if (_loading) {
+      return const Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(
+            child: Text('カメラ初期化中...', style: TextStyle(color: Colors.white))),
+      );
+    }
+    if (_error != null) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('カメラ初期化に失敗しました',
+                  style: TextStyle(color: Colors.white)),
+              const SizedBox(height: 8),
+              Text(_error!,
+                  style: const TextStyle(color: Colors.white70),
+                  textAlign: TextAlign.center),
+              const SizedBox(height: 16),
+              ElevatedButton(
+                onPressed: _loadCameras,
+                child: const Text('再試行'),
+              )
+            ],
+          ),
+        ),
+      );
+    }
+    // 取得できたら本画面へ
+    return _CameraOverlayPage(cameras: _cams!);
   }
 }
 
@@ -93,31 +173,24 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
   CameraController? _cam;
   bool _ready = false;
 
-  // 音声
   final FlutterTts _tts = FlutterTts();
+  final YoloService _yolo = YoloService();
 
-  // 上部/下部の表示内容
-  List<String> topLabels = ['stop', 'speed_limit'];
-  String? bottomLabel = 'speed_limit';
+  List<String> topLabels = [];
+  String? bottomLabel;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _initCamera();
-    _setupTts();
+    _init(); // 背景で順次やる
   }
 
-  Future<void> _setupTts() async {
-    await _tts.setLanguage("ja-JP");
-    await _tts.setSpeechRate(0.5); // ← 速度はここで調整（0.5=ゆっくり）
-    await _tts.setVolume(1.0);
-    await _tts.setPitch(1.0);
-  }
-
-  Future<void> _speak(String text) async {
-    await _tts.stop();
-    await _tts.speak(text);
+  Future<void> _init() async {
+    await _initCamera(); // ① すぐプレビュー
+    Future.delayed(Duration(seconds: 2), _loadYoloInBackground);
+    await _setupTts(); // ② TTS
+    _loadYoloInBackground(); // ③ YOLOは完全バックグラウンド
   }
 
   Future<void> _initCamera() async {
@@ -128,22 +201,114 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
 
     final ctrl = CameraController(
       back,
-      ResolutionPreset.high,
+      ResolutionPreset.low, // 最初は軽い設定
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
 
-    await ctrl.initialize();
-    if (!mounted) return;
+    // ✅ initialize にもタイムアウト
+    try {
+      await Future.any([
+        ctrl.initialize(),
+        Future.delayed(const Duration(seconds: 6),
+            () => throw TimeoutException('camera initialize timeout')),
+      ]);
+    } catch (e) {
+      // タイムアウト・失敗時でもUIを生かす
+      debugPrint('[Camera] initialize error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('カメラ初期化に時間がかかっています。右上から再起動してください。')),
+        );
+      }
+      return;
+    }
 
+    if (!mounted) return;
     setState(() {
       _cam = ctrl;
-      _ready = true;
+      _ready = true; // プレビュー表示OK
     });
+  }
 
-    // 初期表示時に下部テキストを読み上げ
-    final text = bottomLabel != null ? kMeaning[bottomLabel!] : null;
-    if (text != null) _speak(text);
+  void _loadYoloInBackground() {
+    unawaited(Future.microtask(() async {
+      try {
+        await _yolo.loadModel();
+        debugPrint('[YOLO] loaded');
+        if (!mounted) return;
+        // モデル準備できたらストリーム開始（まだなら）
+        _maybeStartStream();
+      } catch (e, st) {
+        debugPrint('[YOLO] load error: $e\n$st');
+      }
+    }));
+  }
+
+  Future<void> _setupTts() async {
+    try {
+      await _tts.setLanguage("ja-JP");
+      await _tts.setSpeechRate(0.5);
+      await _tts.setVolume(1.0);
+      await _tts.setPitch(1.0);
+      _tts.setCompletionHandler(() {
+        if (mounted) setState(() => bottomLabel = null);
+      });
+    } catch (e) {
+      debugPrint('[TTS] setup error: $e');
+    }
+  }
+
+// _maybeStartStream 内のコールバックを差し替え
+  Future<void> _maybeStartStream() async {
+    if (!_yolo.isReady || _cam == null || !_cam!.value.isInitialized) return;
+
+    bool _isProcessing = false;
+    int _frameCount = 0;
+    int _lastMs = DateTime.now().millisecondsSinceEpoch;
+
+    try {
+      await _cam!.startImageStream((CameraImage image) async {
+        // フレーム間引き（どちらか片方でもOK。併用でさらに負荷減）
+        _frameCount++;
+        if (_frameCount % 3 != 0) return; // 3 枚に 1 回だけ処理
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (now - _lastMs < 100) return; // 100ms に 1 回だけ処理
+        _lastMs = now;
+
+        if (_isProcessing) return;
+        _isProcessing = true;
+        try {
+          final bytes = Uint8List.fromList(image.planes[0].bytes);
+          await _processFrame(bytes);
+        } finally {
+          _isProcessing = false;
+        }
+      });
+    } catch (e) {
+      debugPrint('[Camera] startImageStream error: $e');
+    }
+  }
+
+  Future<void> _processFrame(Uint8List bytes) async {
+    if (!_yolo.isReady) return;
+    final results = _yolo.runMock(bytes);
+    if (!mounted) return;
+    setState(() {
+      topLabels = results;
+      bottomLabel = results.isNotEmpty ? results.first : null;
+    });
+    if (bottomLabel != null) {
+      final text = kMeaning[bottomLabel!];
+      if (text != null) _speak(text);
+    }
+  }
+
+  Future<void> _speak(String text) async {
+    try {
+      await _tts.stop();
+      await _tts.speak(text);
+    } catch (_) {}
   }
 
   @override
@@ -155,6 +320,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     } else if (state == AppLifecycleState.resumed) {
       setState(() => _ready = false);
       await _initCamera();
+      _maybeStartStream();
     }
   }
 
@@ -166,14 +332,13 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     super.dispose();
   }
 
-  // 端末の向き→回転角（横固定なので 0 or π）
   double _rotationRad() {
     if (_cam == null) return 0;
     switch (_cam!.value.deviceOrientation) {
       case DeviceOrientation.landscapeLeft:
-        return 0; // 左横持ち
+        return 0;
       case DeviceOrientation.landscapeRight:
-        return math.pi; // 右横持ち（上下反転）
+        return math.pi;
       case DeviceOrientation.portraitUp:
         return -math.pi / 2;
       case DeviceOrientation.portraitDown:
@@ -181,15 +346,12 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     }
   }
 
-  // カメラ映像を“画面いっぱい”に表示
   Widget _buildCameraFull() {
     final c = _cam!;
     if (!c.value.isInitialized) {
-      return const Center(child: CircularProgressIndicator());
+      return const SizedBox.shrink();
     }
-
     final preview = c.value.previewSize!;
-    // iOS は縦基準のため、横表示に合わせて幅高を入れ替え
     final rotatedW = preview.height;
     final rotatedH = preview.width;
 
@@ -210,24 +372,18 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
 
   @override
   Widget build(BuildContext context) {
-    if (!_ready || _cam == null) {
-      return const Scaffold(
-        backgroundColor: Colors.black,
-        body: Center(child: CircularProgressIndicator()),
-      );
-    }
-
-    final bottomText = bottomLabel != null ? kMeaning[bottomLabel!] : null;
-
+    // ✅ もう “無限ぐるぐる” を出さない。必要最小限だけ。
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // ✅ 背景：横画面のカメラを画面いっぱいに
-          _buildCameraFull(),
-
-          // ✅ オーバーレイは SafeArea の内側に配置
+          if (_ready && _cam != null) _buildCameraFull(),
+          if (!_ready)
+            const Center(
+              child:
+                  Text('プレビュー準備中...', style: TextStyle(color: Colors.white70)),
+            ),
           SafeArea(
             child: Stack(
               children: [
@@ -236,80 +392,61 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
                     top: 12,
                     left: 24,
                     right: 24,
-                    child: Center(
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 8,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(8),
-                          boxShadow: const [
-                            BoxShadow(
-                              blurRadius: 6,
-                              color: Colors.black26,
-                              offset: Offset(0, 2),
-                            ),
-                          ],
-                        ),
-                        child: SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: Row(
-                            children: topLabels
-                                .map(
-                                  (k) => Padding(
-                                    padding: const EdgeInsets.only(right: 6),
-                                    child: Chip(
-                                      label: Text(
-                                        kJaName[k] ?? k,
-                                        style: const TextStyle(
-                                          fontSize: 16,
-                                          fontWeight: FontWeight.w600,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                )
-                                .toList(),
-                          ),
-                        ),
-                      ),
+                    child: Wrap(
+                      alignment: WrapAlignment.center,
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: topLabels
+                          .map((k) => Chip(
+                                label: Text(kJaName[k] ?? k),
+                              ))
+                          .toList(),
                     ),
                   ),
-                if (bottomText != null)
+                if (bottomLabel != null)
                   Positioned(
                     left: 24,
                     right: 24,
                     bottom: 16,
                     child: Container(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 12,
-                      ),
+                          horizontal: 16, vertical: 12),
                       decoration: BoxDecoration(
                         color: Colors.white,
                         borderRadius: BorderRadius.circular(8),
                         boxShadow: const [
                           BoxShadow(
-                            blurRadius: 6,
-                            color: Colors.black26,
-                            offset: Offset(0, 2),
-                          ),
+                              blurRadius: 6,
+                              color: Colors.black26,
+                              offset: Offset(0, 2))
                         ],
                       ),
                       child: Text(
-                        bottomText,
+                        kMeaning[bottomLabel!] ?? bottomLabel!,
                         textAlign: TextAlign.center,
                         style: const TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.w700,
-                          color: Colors.red,
-                          letterSpacing: 1.2,
-                        ),
+                            fontSize: 20,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.red,
+                            letterSpacing: 1.2),
                       ),
                     ),
                   ),
+                // 右上に簡易リロード
+                Positioned(
+                  top: 8,
+                  right: 8,
+                  child: IconButton(
+                    color: Colors.white,
+                    icon: const Icon(Icons.refresh),
+                    onPressed: () async {
+                      setState(() => _ready = false);
+                      await _cam?.dispose();
+                      await _initCamera();
+                      _maybeStartStream();
+                    },
+                  ),
+                ),
               ],
             ),
           ),

@@ -5,13 +5,14 @@ publish_to: "none"
 version: 1.0.0+1
 
 environment:
-  sdk: ">=3.9.0 <4.0.0"
+  sdk: ">=3.0.0 <4.0.0"
 
 dependencies:
   flutter:
     sdk: flutter
   camera: ^0.11.0+2
   flutter_tts: ^4.0.2
+  tflite_flutter: ^0.11.0 
 
 dev_dependencies:
   flutter_test:
@@ -19,3 +20,7 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
+  assets:
+    - assets/models/best_float32.tflite
+    - assets/labels_mtsd21.txt
