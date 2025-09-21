@@ -93,137 +93,92 @@ class YoloService {
     }
   }
 
-  /// 出力 shape = [1, 25, 8400] を想定（= [x,y,w,h, 21クラス] × 8400）
   double _sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
 
+  /// 出力 shape = [1, 25, 8400] を想定（= [x,y,w,h, 21クラス(ロジット)] × 8400）
   List<String> runFrame(
     Uint8List rgbBytes,
     int srcW,
     int srcH, {
-    double threshold = 0.50,
+    double threshold = 0.65,
   }) {
     if (!isReady) return [];
 
+    // 前処理
     final input = _preprocess(rgbBytes, srcW, srcH);
-    final inputTensor = input.buffer.asFloat32List().reshape([1, 640, 640, 3]);
 
-    // ✅ 出力テンソルの一覧を取得（個数=length）
-    final outTensors = _interpreter.getOutputTensors();
-    if (outTensors.isEmpty) {
-      debugPrint('[YOLO] No output tensors');
+    // 出力 shape 確認
+    final outT = _interpreter.getOutputTensor(0);
+    final outShape = outT.shape; // 例: [1, 25, 8400]
+    if (outShape.length != 3 || outShape[1] < 5) {
+      debugPrint('[YOLO] Unexpected output shape: $outShape');
       return [];
     }
 
-    // ✅ ここに run のための出力バッファ（Map<int, Object>）を作る
-    final Map<int, Object> outBuffers = {};
-    // 後で読み出すために shape と合わせて保管
-    final List<({int index, List<int> shape, Object buf})> views = [];
+    final channels = outShape[1]; // 25 = 4 + numClasses(=21)
+    final boxes = outShape[2]; // 8400
+    final numClasses = channels - 4;
 
-    for (var i = 0; i < outTensors.length; i++) {
-      final t = outTensors[i];
-      final shape = t.shape; // 例: [1, 26, 8400] / [1, 8400, 26] など
+    // 受け皿
+    final output = List.generate(
+      1,
+      (_) => List.generate(
+        channels,
+        (_) => List<double>.filled(boxes, 0.0),
+      ),
+    );
 
-      if (shape.length != 3) {
-        // 3次元以外はスキップ（PostProcess付きモデルは別処理にする）
-        continue;
-      }
-      final b = shape[0];
-      final a = shape[1];
-      final c = shape[2];
+    // 推論実行
+    _interpreter.run(
+      input.buffer.asFloat32List().reshape([1, 640, 640, 3]),
+      output,
+    );
 
-      // ✅ shape に合わせた3次元のListを用意（batch=1想定）
-      final buf = List.generate(
-        b,
-        (_) => List.generate(a, (_) => List<double>.filled(c, 0.0)),
-      );
-
-      outBuffers[i] = buf;
-      views.add((index: i, shape: shape, buf: buf));
+// --- 後処理 ---
+// softmax 関数（obj なしモデル用）
+    List<double> _softmax(List<double> xs) {
+      final m = xs.reduce((a, b) => a > b ? a : b);
+      final exps = xs.map((x) => math.exp(x - m)).toList();
+      final sum = exps.fold(0.0, (a, b) => a + b);
+      return exps.map((e) => e / sum).toList();
     }
 
-    if (outBuffers.isEmpty) {
-      debugPrint('[YOLO] No usable 3D outputs');
-      return [];
-    }
+    final scored = <(int boxIdx, int classIdx, double score)>[];
+    for (var i = 0; i < boxes; i++) {
+      // ★ obj なしなので softmax を使う
+      final logits =
+          List<double>.generate(numClasses, (c) => output[0][4 + c][i]);
+      final probs = _softmax(logits);
 
-    // ✅ 推論（入力はList、出力はMap<int,Object>）
-    _interpreter.runForMultipleInputs([inputTensor], outBuffers);
-
-    final labels = _labels;
-    final found = <String, double>{};
-
-    double _sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
-
-    void consumeOneOutput(List<int> shape, Object buf) {
-      // buf は List[batch][A][B] 構造
-      final batch = buf as List; // 長さ=1想定
-      final mat = batch[0] as List; // 長さ=A
-      final A = shape[1];
-      final B = shape[2];
-
-      // mat は List<List<double>> のはず（[A][B]）
-      final out = List<List<double>>.from(
-        List.generate(A, (i) => List<double>.from(mat[i] as List)),
-      );
-
-      // どっちがD(=4+1+classes)で、どっちがN(=boxes)かを判定
-      final Dwant = 4 + 1 + labels.length;
-      final candidates = <({int D, int N, bool trans})>[];
-
-      if (A == Dwant && B > A)
-        candidates.add((D: A, N: B, trans: false)); // [D,N]
-      if (B == Dwant && A > B)
-        candidates.add((D: B, N: A, trans: true)); // [N,D]
-
-      if (candidates.isEmpty) {
-        if (A < B && A >= 5) candidates.add((D: A, N: B, trans: false));
-        if (B < A && B >= 5) candidates.add((D: B, N: A, trans: true));
-      }
-      if (candidates.isEmpty) {
-        debugPrint('[YOLO] Unrecognized output shape [1,$A,$B], skip');
-        return;
-      }
-
-      final cand = candidates.first;
-// 置き換え：クラススコア計算部だけ差し替え
-      final D = cand.D;
-      final N = cand.N;
-      double at(int d, int n) => cand.trans ? out[n][d] : out[d][n];
-
-// D == 4 + classes なら obj なし
-      final bool noObj = (D == 4 + labels.length);
-      final int classStart = noObj ? 4 : 5;
-      final int numClasses = D - classStart;
-
-      for (var i = 0; i < N; i++) {
-        // obj ありモデルなら sigmoid(obj)、なしなら 1.0
-        final double obj = noObj ? 1.0 : _sigmoid(at(4, i));
-
-        double bestScore = -1;
-        int bestCls = -1;
-
-        for (var c = 0; c < numClasses; c++) {
-          final clsProb = _sigmoid(at(classStart + c, i));
-          final score = obj * clsProb; // objなしなら = clsProb
-          if (score > bestScore) {
-            bestScore = score;
-            bestCls = c;
-          }
+      // 一番確率の高いクラスだけ採用
+      double best = -1;
+      int bestIdx = -1;
+      for (var c = 0; c < numClasses; c++) {
+        if (probs[c] > best) {
+          best = probs[c];
+          bestIdx = c;
         }
+      }
+      if (bestIdx >= 0) {
+        scored.add((i, bestIdx, best));
+      }
+    }
 
-        if (bestCls >= 0 && bestCls < labels.length && bestScore >= threshold) {
-          final name = labels[bestCls];
-          if (bestScore > (found[name] ?? -1)) found[name] = bestScore;
+// スコア順に上位を使う
+    scored.sort((a, b) => b.$3.compareTo(a.$3));
+    final topK = scored.take(100);
+
+// 閾値以上だけ返す
+    final results = <String>{};
+    for (final s in topK) {
+      if (s.$3 >= threshold) {
+        final idx = s.$2;
+        if (idx >= 0 && idx < _labels.length) {
+          results.add(_labels[idx]);
         }
       }
     }
 
-    for (final v in views) {
-      consumeOneOutput(v.shape, v.buf);
-    }
-
-    final sorted = found.keys.toList()
-      ..sort((a, b) => (found[b]!).compareTo(found[a]!));
-    return sorted;
+    return results.toList();
   }
 }

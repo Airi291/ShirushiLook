@@ -3,12 +3,15 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:io' show Platform;
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+
 import 'yolo.dart';
 
+/// ====== 表示名・読み上げ文言 ======
 const Map<String, String> kJaName = {
   'stop': '一時停止',
   'yield': 'ゆずれ',
@@ -56,6 +59,13 @@ const Map<String, String> kMeaning = {
   'no_overtaking': '追越し禁止。前車に続行。',
   'parking': '駐車できます。周囲安全を確認。',
 };
+
+/// ====== チューニング用定数 ======
+const int kWarmupFrames = 12; // ウォームアップ（推論は捨てる）
+const int kInferIntervalMs = 150; // 推論間隔（約6-7FPS）
+const int kStreakNeed = 2; // 何連続で「確定」とみなすか
+const int kClearAfterNoHit = 3; // 未検出が何フレーム続いたらUIを消すか
+const double kScoreThreshold = 0.30; // YOLOのスコア閾値
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -164,6 +174,11 @@ class _CameraOverlayPage extends StatefulWidget {
 
 class _CameraOverlayPageState extends State<_CameraOverlayPage>
     with WidgetsBindingObserver {
+  // ===== 状態 =====
+  int _warmupLeft = kWarmupFrames; // ウォームアップ残りフレーム
+  int _noHitFrames = 0; // 未検出が続いたフレーム数
+  final Map<String, int> _streak = {}; // 連続ヒット数（クラス別） ← フィールドにするのが重要！
+
   Timer? _inferTimer;
   CameraImage? _latestImage;
   bool _busy = false;
@@ -176,8 +191,9 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
   final FlutterTts _tts = FlutterTts();
   final YoloService _yolo = YoloService();
 
+  bool _hasDetection = false; // 上部チップ列の表示判定
   List<String> topLabels = [];
-  String? bottomLabel;
+  String? bottomLabel; // 安定化して確定した1件
 
   @override
   void initState() {
@@ -251,32 +267,22 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     }
   }
 
-  // YUV420 → RGB（連続 3ch バイト）
+  // ====== フォーマット変換 ======
   Uint8List _yuv420ToRgb(CameraImage image) {
     final w = image.width, h = image.height;
 
-    // Y / U / V プレーン（存在しない場合は null）
     final yPlane = image.planes[0];
     final uPlane = (image.planes.length >= 2) ? image.planes[1] : null;
     final vPlane = (image.planes.length >= 3) ? image.planes[2] : null;
 
-    // --- 形式判定 ---
-    // iOS 典型: NV12 = 2プレーン (Y と UV交互)
-    // Android 多い: 3プレーン (Y,U,V) ただし U/V が interleaved のこともある
     bool isNV12 = image.planes.length == 2;
-
-    // 3プレーンでも V が空/行幅0 なら実質 NV12 とみなす
     if (!isNV12 &&
         (vPlane == null || vPlane.bytes.isEmpty || vPlane.bytesPerRow == 0)) {
       isNV12 = true;
     }
 
-    // ストライド（ビットマップ上の1行のバイト数）
     final yRowStride = yPlane.bytesPerRow;
     final uvRowStride = (uPlane?.bytesPerRow ?? 0);
-
-    // U/V のピクセル間隔：NV12 は必ず 2（[U,V] が交互）
-    // I420/IYUV は 1 だが、端末によって null なのでフォールバック 1
     final uvPixelStride = isNV12 ? 2 : (uPlane?.bytesPerPixel ?? 1);
 
     final out = Uint8List(w * h * 3);
@@ -290,12 +296,10 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
 
         int up, vp;
         if (isNV12) {
-          // plane[1] に [U,V,U,V,...]
           final idx = (x >> 1) * uvPixelStride + uvOff;
           up = uPlane!.bytes[idx];
           vp = uPlane.bytes[idx + 1];
         } else {
-          // U/V 別プレーン
           final idx = (x >> 1) * uvPixelStride + uvOff;
           up = uPlane!.bytes[idx];
           vp = vPlane!.bytes[idx];
@@ -306,15 +310,9 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
         int g = (yp - 0.337633 * (up - 128) - 0.698001 * (vp - 128)).round();
         int b = (yp + 1.732446 * (up - 128)).round();
 
-        if (r < 0)
-          r = 0;
-        else if (r > 255) r = 255;
-        if (g < 0)
-          g = 0;
-        else if (g > 255) g = 255;
-        if (b < 0)
-          b = 0;
-        else if (b > 255) b = 255;
+        r = r.clamp(0, 255);
+        g = g.clamp(0, 255);
+        b = b.clamp(0, 255);
 
         final o = (y * w + x) * 3;
         out[o] = r;
@@ -322,15 +320,14 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
         out[o + 2] = b;
       }
     }
-
     return out;
   }
 
   Uint8List _toRgb(CameraImage image) {
     if (image.format.group == ImageFormatGroup.bgra8888) {
-      // ★ iOS: BGRA → RGB（高速）
+      // iOS: BGRA → RGB
       final w = image.width, h = image.height;
-      final plane = image.planes[0].bytes; // BGRA packed
+      final plane = image.planes[0].bytes;
       final out = Uint8List(w * h * 3);
       int j = 0;
       for (int i = 0; i < plane.length; i += 4) {
@@ -342,35 +339,34 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
         out[j++] = b;
       }
       return out;
-    } else {
-      return _yuv420ToRgb(image);
     }
+    return _yuv420ToRgb(image);
   }
 
+  // ====== ストリーム開始 ======
   Future<void> _maybeStartStream() async {
     if (_streamingStarted) return;
     if (!_yolo.isReady || _cam == null || !_cam!.value.isInitialized) return;
 
     _streamingStarted = true;
 
-    // 常に「最新」だけ保持
     try {
       await _cam!.startImageStream((CameraImage image) {
-        _latestImage = image;
+        _latestImage = image; // 最新のみキープ
       });
     } catch (e) {
       debugPrint('[Camera] startImageStream error: $e');
       return;
     }
 
-    // 150msごとに最新フレームを処理（約6〜7FPS）
-    _inferTimer = Timer.periodic(const Duration(milliseconds: 150), (_) async {
+    _inferTimer = Timer.periodic(const Duration(milliseconds: kInferIntervalMs),
+        (_) async {
       if (_busy) return;
       final img = _latestImage;
       if (img == null) return;
 
       _busy = true;
-      _latestImage = null; // 取り出したら捨てる（溜めない）
+      _latestImage = null;
       try {
         final rgb = _toRgb(img);
         await _processFrame(rgb, img.width, img.height);
@@ -380,6 +376,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     });
   }
 
+  // ====== 推論＆UI更新 ======
   String? _lastSpoken;
   DateTime _lastSpeakTime = DateTime.fromMillisecondsSinceEpoch(0);
   bool _speaking = false;
@@ -387,47 +384,90 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
 
   Future<void> _processFrame(Uint8List rgbBytes, int width, int height) async {
     if (!_yolo.isReady) return;
-    final Map<String, int> _streak = {};
-    final results = _yolo.runFrame(rgbBytes, width, height, threshold: 0.30);
 
-    // 連続ヒットで安定化
-    String? stable;
-    for (final k in results) {
-      _streak[k] = (_streak[k] ?? 0) + 1;
-      if (_streak[k]! >= 2) {
-        // 2フレーム続いたら採用（必要なら3に）
-        stable = k;
+    // ① ウォームアップ中は何も出さない
+    if (_warmupLeft > 0) {
+      _warmupLeft--;
+      if (_warmupLeft == 0) {
+        setState(() {
+          topLabels = [];
+          bottomLabel = null;
+          _hasDetection = false;
+        });
       }
+      return;
     }
-    // 昇順リセット（出なかったラベルのカウントを少しずつ減衰）
-    _streak.keys.where((k) => !results.contains(k)).toList().forEach((k) {
-      final v = (_streak[k] ?? 0) - 1;
-      if (v <= 0) {
-        _streak.remove(k);
-      } else {
-        _streak[k] = v;
+
+    final results =
+        _yolo.runFrame(rgbBytes, width, height, threshold: kScoreThreshold);
+
+    String? stable;
+    if (results.isEmpty) {
+      _noHitFrames++;
+      // 全クラスを減衰
+      _streak.updateAll((_, v) => v > 0 ? v - 1 : 0);
+      if (_noHitFrames >= kClearAfterNoHit) {
+        _clearTopAndBottom();
       }
-    });
+    } else {
+      _noHitFrames = 0;
+      // 出たクラスを加算、出ていないクラスは減衰
+      for (final k in results) {
+        _streak[k] = (_streak[k] ?? 0) + 1;
+        if (_streak[k]! >= kStreakNeed) stable = k;
+      }
+      for (final k in _streak.keys.toList()) {
+        if (!results.contains(k)) {
+          final v = _streak[k]! - 1;
+          if (v <= 0) {
+            _streak.remove(k);
+          } else {
+            _streak[k] = v;
+          }
+        }
+      }
+      _hasDetection = results.isNotEmpty;
+    }
 
-    setState(() {
-      topLabels = results;
-      bottomLabel = results.isNotEmpty ? results.first : null;
-      _debugInfo = _yolo.modelInfo();
-    });
+    if (mounted) {
+      setState(() {
+        topLabels = results; // 上部チップ（生の結果）
+        bottomLabel = stable ?? bottomLabel; // 下部（安定化したら更新）
+        _debugInfo = _yolo.modelInfo();
+      });
+    }
 
-    if (bottomLabel != null) {
-      final now = DateTime.now();
-      final text = kMeaning[bottomLabel!];
+    // 読み上げは「安定化した瞬間」のみに限定
+    if (stable != null) {
+      final text = kMeaning[stable];
       if (text != null) {
-        final same = bottomLabel == _lastSpoken;
+        final now = DateTime.now();
+        final same = stable == _lastSpoken;
         final cool = now.difference(_lastSpeakTime).inSeconds >= 2;
         if (!same || cool) {
-          _lastSpoken = bottomLabel;
+          _lastSpoken = stable;
           _lastSpeakTime = now;
           _enqueue(text);
         }
       }
     }
+
+    // しばらく未検出が続いたら下部も消す
+    if (_noHitFrames >= kClearAfterNoHit && bottomLabel != null) {
+      setState(() {
+        bottomLabel = null;
+        _hasDetection = false;
+      });
+    }
+  }
+
+  void _clearTopAndBottom() {
+    if (!mounted) return;
+    setState(() {
+      topLabels = [];
+      bottomLabel = null;
+      _hasDetection = false;
+    });
   }
 
   void _enqueue(String text) {
@@ -452,6 +492,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     }
   }
 
+  // ====== ライフサイクル ======
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) async {
     final cam = _cam;
@@ -476,6 +517,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     super.dispose();
   }
 
+  // ====== UI ======
   double _rotationRad() {
     if (_cam == null) return 0;
     switch (_cam!.value.deviceOrientation) {
@@ -510,6 +552,15 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     );
   }
 
+  void _resetStabilizationState() {
+    _warmupLeft = kWarmupFrames;
+    _noHitFrames = 0;
+    _streak.clear();
+    _hasDetection = false;
+    topLabels = [];
+    bottomLabel = null;
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -520,13 +571,12 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
           if (_ready && _cam != null) _cameraPreview(),
           if (!_ready)
             const Center(
-              child:
-                  Text('プレビュー準備中...', style: TextStyle(color: Colors.white70)),
-            ),
+                child: Text('プレビュー準備中...',
+                    style: TextStyle(color: Colors.white70))),
           SafeArea(
             child: Stack(
               children: [
-                if (_yolo.isReady && topLabels.isNotEmpty)
+                if (_hasDetection && topLabels.isNotEmpty)
                   Positioned(
                     top: 12,
                     left: 24,
@@ -553,10 +603,9 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
                         borderRadius: BorderRadius.circular(8),
                         boxShadow: const [
                           BoxShadow(
-                            blurRadius: 6,
-                            color: Colors.black26,
-                            offset: Offset(0, 2),
-                          ),
+                              blurRadius: 6,
+                              color: Colors.black26,
+                              offset: Offset(0, 2))
                         ],
                       ),
                       child: Text(
@@ -581,18 +630,16 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
                         padding: const EdgeInsets.symmetric(
                             horizontal: 8, vertical: 6),
                         color: Colors.black54,
-                        child: Text(
-                          _debugInfo,
-                          style: const TextStyle(
-                              color: Colors.white, fontSize: 12),
-                        ),
+                        child: Text(_debugInfo,
+                            style: const TextStyle(
+                                color: Colors.white, fontSize: 12)),
                       ),
                       const SizedBox(width: 8),
                       IconButton(
                         color: Colors.white,
                         icon: const Icon(Icons.refresh),
                         onPressed: () async {
-                          setState(() => _ready = false);
+                          setState(_resetStabilizationState);
                           await _cam?.dispose();
                           await _initCamera();
                           _maybeStartStream();
