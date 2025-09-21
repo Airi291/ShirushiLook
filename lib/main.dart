@@ -1,36 +1,41 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ]);
+
   final cameras = await availableCameras();
-  runApp(MyApp(cameras: cameras));
+  runApp(App(cameras: cameras));
 }
 
-class MyApp extends StatelessWidget {
+class App extends StatelessWidget {
   final List<CameraDescription> cameras;
-  const MyApp({super.key, required this.cameras});
+  const App({super.key, required this.cameras});
 
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      home: CameraPreviewPage(cameras: cameras),
-    );
-  }
+  Widget build(BuildContext context) => MaterialApp(
+    debugShowCheckedModeBanner: false,
+    home: DemoOverlayPage(cameras: cameras),
+  );
 }
 
-class CameraPreviewPage extends StatefulWidget {
+class DemoOverlayPage extends StatefulWidget {
   final List<CameraDescription> cameras;
-  const CameraPreviewPage({super.key, required this.cameras});
+  const DemoOverlayPage({super.key, required this.cameras});
 
   @override
-  State<CameraPreviewPage> createState() => _CameraPreviewPageState();
+  State<DemoOverlayPage> createState() => _DemoOverlayPageState();
 }
 
-class _CameraPreviewPageState extends State<CameraPreviewPage>
+class _DemoOverlayPageState extends State<DemoOverlayPage>
     with WidgetsBindingObserver {
-  CameraController? _controller;
+  CameraController? _cam;
   bool _ready = false;
 
   @override
@@ -41,32 +46,27 @@ class _CameraPreviewPageState extends State<CameraPreviewPage>
   }
 
   Future<void> _init() async {
-    // 背面カメラ優先。なければ先頭を使用
-    final cam = widget.cameras.firstWhere(
+    final back = widget.cameras.firstWhere(
       (c) => c.lensDirection == CameraLensDirection.back,
       orElse: () => widget.cameras.first,
     );
-
-    final controller = CameraController(
-      cam,
+    _cam = CameraController(
+      back,
       ResolutionPreset.high,
-      enableAudio: false, // 映像だけ
+      enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
-
-    _controller = controller;
-    await controller.initialize();
+    await _cam!.initialize();
     if (!mounted) return;
     setState(() => _ready = true);
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) async {
-    final controller = _controller;
-    if (controller == null) return;
-
+    final cam = _cam;
+    if (cam == null) return;
     if (state == AppLifecycleState.inactive) {
-      await controller.dispose();
+      await cam.dispose();
     } else if (state == AppLifecycleState.resumed) {
       setState(() => _ready = false);
       await _init();
@@ -76,20 +76,95 @@ class _CameraPreviewPageState extends State<CameraPreviewPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _controller?.dispose();
+    _cam?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!_ready || _controller == null) {
-      return const MaterialApp(
-        home: Scaffold(body: Center(child: CircularProgressIndicator())),
-      );
+    if (!_ready || _cam == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      home: Scaffold(body: SafeArea(child: CameraPreview(_controller!))),
+
+    return Scaffold(
+      body: SafeArea(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            // カメラ映像
+            CameraPreview(_cam!),
+
+            // 上部バナー（白背景に赤文字）: 「一時停止」
+            Positioned(
+              top: 12,
+              left: 24,
+              right: 24,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 10,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(8),
+                    boxShadow: const [
+                      BoxShadow(
+                        blurRadius: 6,
+                        color: Colors.black26,
+                        offset: Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: const Text(
+                    '一時停止',
+                    style: TextStyle(
+                      fontSize: 28,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.red,
+                      letterSpacing: 2,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+            // 下部バナー（白背景に赤文字）: 「ここで止まる必要があります」
+            Positioned(
+              left: 24,
+              right: 24,
+              bottom: 16,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(8),
+                  boxShadow: const [
+                    BoxShadow(
+                      blurRadius: 6,
+                      color: Colors.black26,
+                      offset: Offset(0, 2),
+                    ),
+                  ],
+                ),
+                child: const Text(
+                  'ここで止まる必要があります',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.red,
+                    letterSpacing: 1.5,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
