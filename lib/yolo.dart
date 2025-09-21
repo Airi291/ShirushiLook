@@ -1,16 +1,21 @@
 // lib/yolo.dart
 import 'dart:typed_data';
-import 'package:flutter/foundation.dart';
-import 'package:tflite_flutter/tflite_flutter.dart';
-import 'package:flutter/services.dart' show rootBundle;
-import 'package:image/image.dart' as img;
 import 'dart:math' as math;
 import 'dart:io' show Platform;
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:image/image.dart' as img;
+import 'package:tflite_flutter/tflite_flutter.dart';
+
 class YoloService {
+  List<MapEntry<String, double>> lastTop = const [];
   bool isReady = false;
   late Interpreter _interpreter;
   late List<String> _labels;
+
+  /// 右上HUDなどで使う簡易デバッグ行（処理時間・ヒット数・上位3件）
+  String lastDebugLine = '';
 
   Future<void> loadModel() async {
     // ラベル読込
@@ -25,10 +30,10 @@ class YoloService {
     final options = InterpreterOptions()..threads = 2;
     try {
       if (Platform.isAndroid) {
-        options.addDelegate(GpuDelegateV2()); // AndroidのみGPU
+        options.addDelegate(GpuDelegateV2());
         debugPrint('[YOLO] GPU delegate enabled');
       } else {
-        debugPrint('[YOLO] iOS: CPU 使用'); // iOSはまずCPUで安定化
+        debugPrint('[YOLO] iOS: CPU 使用');
       }
     } catch (e) {
       debugPrint('[YOLO] delegate setup failed: $e (CPU継続)');
@@ -36,15 +41,16 @@ class YoloService {
 
     try {
       _interpreter = await Interpreter.fromAsset(
-          'assets/models/best_float32.tflite',
-          options: options);
+        'assets/models/best_float32.tflite',
+        options: options,
+      );
     } catch (e) {
-      // 最終フォールバック（CPU）
       debugPrint(
           '[YOLO] Interpreter init failed with delegate: $e — retry CPU only');
       _interpreter = await Interpreter.fromAsset(
-          'assets/models/best_float32.tflite',
-          options: InterpreterOptions()..threads = 2);
+        'assets/models/best_float32.tflite',
+        options: InterpreterOptions()..threads = 2,
+      );
     }
 
     // モデル情報ログ
@@ -65,21 +71,30 @@ class YoloService {
       width: srcW,
       height: srcH,
       bytes: rgbBytes.buffer,
+      rowStride: srcW * 3,
       numChannels: 3,
+      order: img.ChannelOrder.rgb,
     );
 
     final resized = img.copyResize(rgbImg, width: 640, height: 640);
 
     final out = Float32List(640 * 640 * 3);
     int i = 0;
+    double mean = 0.0;
     for (var y = 0; y < 640; y++) {
       for (var x = 0; x < 640; x++) {
         final p = resized.getPixel(x, y);
-        out[i++] = p.r / 255.0;
-        out[i++] = p.g / 255.0;
-        out[i++] = p.b / 255.0;
+        final r = p.r / 255.0;
+        final g = p.g / 255.0;
+        final b = p.b / 255.0;
+        out[i++] = r;
+        out[i++] = g;
+        out[i++] = b;
+        mean += (r + g + b) / 3.0;
       }
     }
+    mean /= (out.length / 3);
+    lastDebugLine = 'pre_mean=${mean.toStringAsFixed(3)}';
     return out;
   }
 
@@ -93,9 +108,10 @@ class YoloService {
     }
   }
 
-  double _sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
-
-  /// 出力 shape = [1, 25, 8400] を想定（= [x,y,w,h, 21クラス(ロジット)] × 8400）
+  /// 出力 shape = [1, 25, 8400] を想定
+  /// 閾値は一旦 0.15 に下げて様子見（後で上げ戻す）
+// lib/yolo.dart の runFrame を丸ごと置き換え
+  /// 出力 shape = [1, 25, 8400] を想定（= 4 + 21クラス）
   List<String> runFrame(
     Uint8List rgbBytes,
     int srcW,
@@ -104,81 +120,113 @@ class YoloService {
   }) {
     if (!isReady) return [];
 
-    // 前処理
-    final input = _preprocess(rgbBytes, srcW, srcH);
+    // === 計測 ===
+    final swPre = Stopwatch()..start();
+    final input = _preprocess(
+        rgbBytes, srcW, srcH); // pre_mean は _preprocess 内で lastDebugLine に入る
+    swPre.stop();
 
-    // 出力 shape 確認
+    // 出力 shape
     final outT = _interpreter.getOutputTensor(0);
-    final outShape = outT.shape; // 例: [1, 25, 8400]
+    final outShape = outT.shape; // 期待: [1,25,8400]
     if (outShape.length != 3 || outShape[1] < 5) {
-      debugPrint('[YOLO] Unexpected output shape: $outShape');
+      lastDebugLine = 'bad shape: $outShape | $lastDebugLine';
       return [];
     }
+    final cDim = outShape[1]; // 25
+    final nBox = outShape[2]; // 8400
+    final numClasses = cDim - 4; // 21
 
-    final channels = outShape[1]; // 25 = 4 + numClasses(=21)
-    final boxes = outShape[2]; // 8400
-    final numClasses = channels - 4;
-
-    // 受け皿
+    // 受け皿（ListでOK）
     final output = List.generate(
       1,
       (_) => List.generate(
-        channels,
-        (_) => List<double>.filled(boxes, 0.0),
+        cDim,
+        (_) => List<double>.filled(nBox, 0.0),
       ),
     );
 
-    // 推論実行
+    // 推論
+    final swInfer = Stopwatch()..start();
     _interpreter.run(
       input.buffer.asFloat32List().reshape([1, 640, 640, 3]),
       output,
     );
+    swInfer.stop();
 
-// --- 後処理 ---
-// softmax 関数（obj なしモデル用）
-    List<double> _softmax(List<double> xs) {
-      final m = xs.reduce((a, b) => a > b ? a : b);
-      final exps = xs.map((x) => math.exp(x - m)).toList();
-      final sum = exps.fold(0.0, (a, b) => a + b);
-      return exps.map((e) => e / sum).toList();
+    // 後処理
+    final swPost = Stopwatch()..start();
+
+    // logit 範囲を見る（ゼロ地獄チェック）
+    double minLogit = double.infinity, maxLogit = -double.infinity;
+    for (int i = 0; i < nBox; i++) {
+      for (int c = 0; c < numClasses; c++) {
+        final v = output[0][4 + c][i];
+        if (v < minLogit) minLogit = v;
+        if (v > maxLogit) maxLogit = v;
+      }
     }
 
-    final scored = <(int boxIdx, int classIdx, double score)>[];
-    for (var i = 0; i < boxes; i++) {
-      // ★ obj なしなので softmax を使う
-      final logits =
-          List<double>.generate(numClasses, (c) => output[0][4 + c][i]);
-      final probs = _softmax(logits);
+    // obj なしモデル想定：各クラスに sigmoid
+    double sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
 
-      // 一番確率の高いクラスだけ採用
+    final scored = <(int boxIdx, int classIdx, double score)>[];
+    for (int i = 0; i < nBox; i++) {
       double best = -1;
       int bestIdx = -1;
-      for (var c = 0; c < numClasses; c++) {
-        if (probs[c] > best) {
-          best = probs[c];
+      for (int c = 0; c < numClasses; c++) {
+        final logit = output[0][4 + c][i];
+        final prob = sigmoid(logit);
+        if (prob > best) {
+          best = prob;
           bestIdx = c;
         }
       }
-      if (bestIdx >= 0) {
-        scored.add((i, bestIdx, best));
-      }
+      if (bestIdx >= 0) scored.add((i, bestIdx, best));
     }
 
-// スコア順に上位を使う
+    // スコア順
     scored.sort((a, b) => b.$3.compareTo(a.$3));
-    final topK = scored.take(100);
 
-// 閾値以上だけ返す
-    final results = <String>{};
-    for (final s in topK) {
-      if (s.$3 >= threshold) {
-        final idx = s.$2;
-        if (idx >= 0 && idx < _labels.length) {
-          results.add(_labels[idx]);
-        }
+    // 各クラス名ごとの最高スコアを集計（threshold もここで適用）
+    final Map<String, double> bestByLabel = {};
+    for (final s in scored) {
+      final idx = s.$2;
+      if (idx < 0 || idx >= _labels.length) continue;
+      final label = _labels[idx];
+      final score = s.$3;
+      if (score >= threshold) {
+        final prev = bestByLabel[label];
+        if (prev == null || score > prev) bestByLabel[label] = score;
+      } else {
+        // 以降はスコアが下がるので打ち切り（任意）
+        break;
       }
     }
 
-    return results.toList();
+    // UI で使う上位表示用ソート済みリストを保存
+    lastTop = bestByLabel.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+
+    // 返却用（ユニークなラベル一覧）
+    final unique = bestByLabel.keys.toSet();
+
+    // デバッグ用 top3 表示
+    final top3Dbg = lastTop
+        .take(3)
+        .map((e) => '${e.key}(${e.value.toStringAsFixed(2)})')
+        .toList();
+
+    swPost.stop();
+
+    final preMeanLine = lastDebugLine;
+    lastDebugLine = 'pre=${swPre.elapsedMilliseconds}ms '
+        'infer=${swInfer.elapsedMilliseconds}ms '
+        'post=${swPost.elapsedMilliseconds}ms '
+        'hits=${unique.length} '
+        'logit=[${minLogit.toStringAsFixed(2)},${maxLogit.toStringAsFixed(2)}] '
+        'top3=${top3Dbg.join(", ")} | $preMeanLine';
+
+    return unique.toList();
   }
 }

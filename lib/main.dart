@@ -65,7 +65,7 @@ const int kWarmupFrames = 12; // ウォームアップ（推論は捨てる）
 const int kInferIntervalMs = 150; // 推論間隔（約6-7FPS）
 const int kStreakNeed = 2; // 何連続で「確定」とみなすか
 const int kClearAfterNoHit = 3; // 未検出が何フレーム続いたらUIを消すか
-const double kScoreThreshold = 0.30; // YOLOのスコア閾値
+const double kScoreThreshold = 0.65; // YOLOのスコア閾値
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -174,6 +174,15 @@ class _CameraOverlayPage extends StatefulWidget {
 
 class _CameraOverlayPageState extends State<_CameraOverlayPage>
     with WidgetsBindingObserver {
+  // ===== デバッグHUD用 =====
+  bool _debugHud = false; // 必要に応じて切替
+  int _framesSeen = 0;
+  int _framesSeenLast = 0;
+  double _fps = 0;
+  DateTime _lastFpsAt = DateTime.now();
+  int _resultsCount = 0;
+  String _last3 = "";
+
   // ===== 状態 =====
   int _warmupLeft = kWarmupFrames; // ウォームアップ残りフレーム
   int _noHitFrames = 0; // 未検出が続いたフレーム数
@@ -344,6 +353,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
   }
 
   // ====== ストリーム開始 ======
+// ====== ストリーム開始 ======
   Future<void> _maybeStartStream() async {
     if (_streamingStarted) return;
     if (!_yolo.isReady || _cam == null || !_cam!.value.isInitialized) return;
@@ -370,6 +380,16 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
       try {
         final rgb = _toRgb(img);
         await _processFrame(rgb, img.width, img.height);
+
+        // === 追加: FPS 計測 ===
+        _framesSeen++;
+        final now = DateTime.now();
+        final ms = now.difference(_lastFpsAt).inMilliseconds;
+        if (ms >= 1000) {
+          _fps = (_framesSeen - _framesSeenLast) / (ms / 1000.0);
+          _framesSeenLast = _framesSeen;
+          _lastFpsAt = now;
+        }
       } finally {
         _busy = false;
       }
@@ -385,7 +405,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
   Future<void> _processFrame(Uint8List rgbBytes, int width, int height) async {
     if (!_yolo.isReady) return;
 
-    // ① ウォームアップ中は何も出さない
+    // ウォームアップ処理
     if (_warmupLeft > 0) {
       _warmupLeft--;
       if (_warmupLeft == 0) {
@@ -401,17 +421,24 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     final results =
         _yolo.runFrame(rgbBytes, width, height, threshold: kScoreThreshold);
 
+    // ---- 上位3件（閾値以上）を表示用に抽出 ----
+    final top3Entries =
+        _yolo.lastTop.where((e) => e.value >= kScoreThreshold).take(3).toList();
+
+    // 上部チップに出す英語ラベル配列
+    final top3Labels = top3Entries.map((e) => e.key).toList();
+
+    // HUD に出す日本語の短い文字列
+    final hudKindsShort = top3Labels.map((k) => kJaName[k] ?? k).join(', ');
+
+    // ③ 連続ヒットによる安定化
     String? stable;
     if (results.isEmpty) {
       _noHitFrames++;
-      // 全クラスを減衰
       _streak.updateAll((_, v) => v > 0 ? v - 1 : 0);
-      if (_noHitFrames >= kClearAfterNoHit) {
-        _clearTopAndBottom();
-      }
+      if (_noHitFrames >= kClearAfterNoHit) _clearTopAndBottom();
     } else {
       _noHitFrames = 0;
-      // 出たクラスを加算、出ていないクラスは減衰
       for (final k in results) {
         _streak[k] = (_streak[k] ?? 0) + 1;
         if (_streak[k]! >= kStreakNeed) stable = k;
@@ -429,15 +456,23 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
       _hasDetection = results.isNotEmpty;
     }
 
+    // ④ UI 更新（stable が宣言された後に参照）
     if (mounted) {
       setState(() {
-        topLabels = results; // 上部チップ（生の結果）
-        bottomLabel = stable ?? bottomLabel; // 下部（安定化したら更新）
-        _debugInfo = _yolo.modelInfo();
+        // 上部は上位3件のみ
+        topLabels = top3Labels;
+
+        // 下段は従来どおり安定化した1件
+        bottomLabel = stable ?? bottomLabel;
+
+        // HUD 表示（hits も上部表示に合わせる）
+        _debugInfo = 'hits: ${top3Labels.length} | $hudKindsShort\n'
+            '${_yolo.modelInfo()}\n'
+            '${_yolo.lastDebugLine}';
       });
     }
 
-    // 読み上げは「安定化した瞬間」のみに限定
+    // ⑤ TTS
     if (stable != null) {
       final text = kMeaning[stable];
       if (text != null) {
@@ -452,7 +487,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
       }
     }
 
-    // しばらく未検出が続いたら下部も消す
+    // ⑥ 長く未検出が続いたら下段も消す
     if (_noHitFrames >= kClearAfterNoHit && bottomLabel != null) {
       setState(() {
         bottomLabel = null;
@@ -553,12 +588,13 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
   }
 
   void _resetStabilizationState() {
-    _warmupLeft = kWarmupFrames;
-    _noHitFrames = 0;
-    _streak.clear();
-    _hasDetection = false;
-    topLabels = [];
-    bottomLabel = null;
+    // HUD リセット
+    _framesSeen = 0;
+    _framesSeenLast = 0;
+    _fps = 0;
+    _lastFpsAt = DateTime.now();
+    _resultsCount = 0;
+    _last3 = "";
   }
 
   @override
@@ -630,9 +666,14 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
                         padding: const EdgeInsets.symmetric(
                             horizontal: 8, vertical: 6),
                         color: Colors.black54,
-                        child: Text(_debugInfo,
-                            style: const TextStyle(
-                                color: Colors.white, fontSize: 12)),
+                        // child: Text(
+                        //   _debugHud
+                        //       ? 'fps=${_fps.toStringAsFixed(1)}  warmup=$_warmupLeft  '
+                        //           'hits=$_resultsCount  top3=$_last3\n$_debugInfo'
+                        //       : _debugInfo,
+                        //   style: const TextStyle(
+                        //       color: Colors.white, fontSize: 12),
+                        // ),
                       ),
                       const SizedBox(width: 8),
                       IconButton(
