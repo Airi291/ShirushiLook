@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
@@ -55,82 +56,94 @@ const Map<String, String> kMeaning = {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
   // 横画面固定
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
   ]);
+
   final cameras = await availableCameras();
-  runApp(App(cameras: cameras));
+  runApp(_App(cameras: cameras));
 }
 
-class App extends StatelessWidget {
+class _App extends StatelessWidget {
   final List<CameraDescription> cameras;
-  const App({super.key, required this.cameras});
+  const _App({super.key, required this.cameras});
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    debugShowCheckedModeBanner: false,
-    home: DemoOverlayPage(cameras: cameras),
-  );
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: _CameraOverlayPage(cameras: cameras),
+    );
+  }
 }
 
-class DemoOverlayPage extends StatefulWidget {
+class _CameraOverlayPage extends StatefulWidget {
   final List<CameraDescription> cameras;
-  const DemoOverlayPage({super.key, required this.cameras});
+  const _CameraOverlayPage({super.key, required this.cameras});
+
   @override
-  State<DemoOverlayPage> createState() => _DemoOverlayPageState();
+  State<_CameraOverlayPage> createState() => _CameraOverlayPageState();
 }
 
-class _DemoOverlayPageState extends State<DemoOverlayPage>
+class _CameraOverlayPageState extends State<_CameraOverlayPage>
     with WidgetsBindingObserver {
   CameraController? _cam;
   bool _ready = false;
 
+  // 音声
   final FlutterTts _tts = FlutterTts();
 
-  List<String> topLabels = ['stop', 'speed_limit']; // 上部の文字
-  String? bottomLabel = 'speed_limit'; // 下部の文字
+  // 上部/下部の表示内容
+  List<String> topLabels = ['stop', 'speed_limit'];
+  String? bottomLabel = 'speed_limit';
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _init();
+    _initCamera();
     _setupTts();
   }
 
-  void _setupTts() async {
-    await _tts.setLanguage("ja-JP"); // 日本語
-    await _tts.setSpeechRate(0.5); // 読み上げ速度
+  Future<void> _setupTts() async {
+    await _tts.setLanguage("ja-JP");
+    await _tts.setSpeechRate(0.5); // ← 速度はここで調整（0.5=ゆっくり）
     await _tts.setVolume(1.0);
     await _tts.setPitch(1.0);
   }
 
   Future<void> _speak(String text) async {
-    await _tts.stop(); // 前の読み上げを止める
+    await _tts.stop();
     await _tts.speak(text);
   }
 
-  Future<void> _init() async {
+  Future<void> _initCamera() async {
     final back = widget.cameras.firstWhere(
       (c) => c.lensDirection == CameraLensDirection.back,
       orElse: () => widget.cameras.first,
     );
-    _cam = CameraController(
+
+    final ctrl = CameraController(
       back,
       ResolutionPreset.high,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
-    await _cam!.initialize();
-    if (!mounted) return;
-    setState(() => _ready = true);
 
-    // ★ カメラ準備ができたら bottomLabel の意味を読み上げる
-    if (bottomLabel != null && kMeaning[bottomLabel!] != null) {
-      _speak(kMeaning[bottomLabel!]!);
-    }
+    await ctrl.initialize();
+    if (!mounted) return;
+
+    setState(() {
+      _cam = ctrl;
+      _ready = true;
+    });
+
+    // 初期表示時に下部テキストを読み上げ
+    final text = bottomLabel != null ? kMeaning[bottomLabel!] : null;
+    if (text != null) _speak(text);
   }
 
   @override
@@ -141,7 +154,7 @@ class _DemoOverlayPageState extends State<DemoOverlayPage>
       await cam.dispose();
     } else if (state == AppLifecycleState.resumed) {
       setState(() => _ready = false);
-      await _init();
+      await _initCamera();
     }
   }
 
@@ -149,110 +162,158 @@ class _DemoOverlayPageState extends State<DemoOverlayPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _cam?.dispose();
-    _tts.stop(); // ★TTSを終了
+    _tts.stop();
     super.dispose();
+  }
+
+  // 端末の向き→回転角（横固定なので 0 or π）
+  double _rotationRad() {
+    if (_cam == null) return 0;
+    switch (_cam!.value.deviceOrientation) {
+      case DeviceOrientation.landscapeLeft:
+        return 0; // 左横持ち
+      case DeviceOrientation.landscapeRight:
+        return math.pi; // 右横持ち（上下反転）
+      case DeviceOrientation.portraitUp:
+        return -math.pi / 2;
+      case DeviceOrientation.portraitDown:
+        return math.pi / 2;
+    }
+  }
+
+  // カメラ映像を“画面いっぱい”に表示
+  Widget _buildCameraFull() {
+    final c = _cam!;
+    if (!c.value.isInitialized) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final preview = c.value.previewSize!;
+    // iOS は縦基準のため、横表示に合わせて幅高を入れ替え
+    final rotatedW = preview.height;
+    final rotatedH = preview.width;
+
+    return SizedBox.expand(
+      child: FittedBox(
+        fit: BoxFit.cover,
+        child: SizedBox(
+          width: rotatedW,
+          height: rotatedH,
+          child: Transform.rotate(
+            angle: _rotationRad(),
+            child: CameraPreview(c),
+          ),
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     if (!_ready || _cam == null) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return const Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(child: CircularProgressIndicator()),
+      );
     }
 
     final bottomText = bottomLabel != null ? kMeaning[bottomLabel!] : null;
 
     return Scaffold(
-      body: SafeArea(
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            // カメラ映像
-            CameraPreview(_cam!),
+      backgroundColor: Colors.black,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          // ✅ 背景：横画面のカメラを画面いっぱいに
+          _buildCameraFull(),
 
-            // 上部ラベル
-            if (topLabels.isNotEmpty)
-              Positioned(
-                top: 12,
-                left: 24,
-                right: 24,
-                child: Center(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(8),
-                      boxShadow: const [
-                        BoxShadow(
-                          blurRadius: 6,
-                          color: Colors.black26,
-                          offset: Offset(0, 2),
+          // ✅ オーバーレイは SafeArea の内側に配置
+          SafeArea(
+            child: Stack(
+              children: [
+                if (topLabels.isNotEmpty)
+                  Positioned(
+                    top: 12,
+                    left: 24,
+                    right: 24,
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
                         ),
-                      ],
-                    ),
-                    child: SingleChildScrollView(
-                      scrollDirection: Axis.horizontal,
-                      child: Row(
-                        children: topLabels
-                            .map(
-                              (k) => Padding(
-                                padding: const EdgeInsets.only(right: 6),
-                                child: Chip(
-                                  label: Text(
-                                    kJaName[k] ?? k,
-                                    style: const TextStyle(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w600,
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(8),
+                          boxShadow: const [
+                            BoxShadow(
+                              blurRadius: 6,
+                              color: Colors.black26,
+                              offset: Offset(0, 2),
+                            ),
+                          ],
+                        ),
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: topLabels
+                                .map(
+                                  (k) => Padding(
+                                    padding: const EdgeInsets.only(right: 6),
+                                    child: Chip(
+                                      label: Text(
+                                        kJaName[k] ?? k,
+                                        style: const TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
                                     ),
                                   ),
-                                ),
-                              ),
-                            )
-                            .toList(),
+                                )
+                                .toList(),
+                          ),
+                        ),
                       ),
                     ),
                   ),
-                ),
-              ),
-
-            // 下部の意味
-            if (bottomText != null)
-              Positioned(
-                left: 24,
-                right: 24,
-                bottom: 16,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 12,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(8),
-                    boxShadow: const [
-                      BoxShadow(
-                        blurRadius: 6,
-                        color: Colors.black26,
-                        offset: Offset(0, 2),
+                if (bottomText != null)
+                  Positioned(
+                    left: 24,
+                    right: 24,
+                    bottom: 16,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 12,
                       ),
-                    ],
-                  ),
-                  child: Text(
-                    bottomText,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w700,
-                      color: Colors.red,
-                      letterSpacing: 1.2,
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(8),
+                        boxShadow: const [
+                          BoxShadow(
+                            blurRadius: 6,
+                            color: Colors.black26,
+                            offset: Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      child: Text(
+                        bottomText,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.red,
+                          letterSpacing: 1.2,
+                        ),
+                      ),
                     ),
                   ),
-                ),
-              ),
-          ],
-        ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
