@@ -76,7 +76,6 @@ class _App extends StatelessWidget {
   }
 }
 
-/// まずはプレースホルダーを表示してからカメラを取る
 class _Entry extends StatefulWidget {
   const _Entry({super.key});
   @override
@@ -100,7 +99,6 @@ class _EntryState extends State<_Entry> {
       _error = null;
     });
     try {
-      // ✅ タイムアウトをかけて固まりを回避
       final cams = await Future.any<List<CameraDescription>>([
         availableCameras(),
         Future<List<CameraDescription>>.delayed(
@@ -183,14 +181,14 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _init(); // 背景で順次やる
+    _init();
   }
 
   Future<void> _init() async {
     await _initCamera(); // ① すぐプレビュー
     Future.delayed(Duration(seconds: 2), _loadYoloInBackground);
     await _setupTts(); // ② TTS
-    _loadYoloInBackground(); // ③ YOLOは完全バックグラウンド
+    _loadYoloInBackground(); // ③ YOLO
   }
 
   Future<void> _initCamera() async {
@@ -201,12 +199,11 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
 
     final ctrl = CameraController(
       back,
-      ResolutionPreset.low, // 最初は軽い設定
+      ResolutionPreset.low,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
 
-    // ✅ initialize にもタイムアウト
     try {
       await Future.any([
         ctrl.initialize(),
@@ -214,7 +211,6 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
             () => throw TimeoutException('camera initialize timeout')),
       ]);
     } catch (e) {
-      // タイムアウト・失敗時でもUIを生かす
       debugPrint('[Camera] initialize error: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -237,7 +233,6 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
         await _yolo.loadModel();
         debugPrint('[YOLO] loaded');
         if (!mounted) return;
-        // モデル準備できたらストリーム開始（まだなら）
         _maybeStartStream();
       } catch (e, st) {
         debugPrint('[YOLO] load error: $e\n$st');
@@ -251,15 +246,11 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
       await _tts.setSpeechRate(0.5);
       await _tts.setVolume(1.0);
       await _tts.setPitch(1.0);
-      _tts.setCompletionHandler(() {
-        if (mounted) setState(() => bottomLabel = null);
-      });
     } catch (e) {
       debugPrint('[TTS] setup error: $e');
     }
   }
 
-// _maybeStartStream 内のコールバックを差し替え
   Future<void> _maybeStartStream() async {
     if (!_yolo.isReady || _cam == null || !_cam!.value.isInitialized) return;
 
@@ -269,7 +260,6 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
 
     try {
       await _cam!.startImageStream((CameraImage image) async {
-        // フレーム間引き（どちらか片方でもOK。併用でさらに負荷減）
         _frameCount++;
         if (_frameCount % 3 != 0) return; // 3 枚に 1 回だけ処理
         final now = DateTime.now().millisecondsSinceEpoch;
@@ -290,25 +280,62 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     }
   }
 
+  String? _lastSpoken;
+  DateTime _lastSpeakTime = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _isSpeaking = false;
+  final List<String> _speakQueue = [];
+
   Future<void> _processFrame(Uint8List bytes) async {
     if (!_yolo.isReady) return;
     final results = _yolo.runMock(bytes);
     if (!mounted) return;
+
     setState(() {
       topLabels = results;
       bottomLabel = results.isNotEmpty ? results.first : null;
     });
+
     if (bottomLabel != null) {
+      final now = DateTime.now();
       final text = kMeaning[bottomLabel!];
-      if (text != null) _speak(text);
+
+      if (text != null) {
+        // 🔑 2秒クールダウン & 同じ標識を連呼しない
+        final isSameAsBefore = bottomLabel == _lastSpoken;
+        final isCooldownOver = now.difference(_lastSpeakTime).inSeconds >= 2;
+
+        if (!isSameAsBefore || isCooldownOver) {
+          _lastSpoken = bottomLabel;
+          _lastSpeakTime = now;
+          _enqueueSpeak(text);
+        }
+      }
     }
   }
 
-  Future<void> _speak(String text) async {
+  void _enqueueSpeak(String text) {
+    _speakQueue.add(text);
+    if (!_isSpeaking) _dequeueAndSpeak();
+  }
+
+  Future<void> _dequeueAndSpeak() async {
+    if (_speakQueue.isEmpty) return;
+    _isSpeaking = true;
+    final text = _speakQueue.removeAt(0);
+
     try {
-      await _tts.stop();
+      await _tts.stop(); // 前の音声をキャンセル
       await _tts.speak(text);
-    } catch (_) {}
+      _tts.setCompletionHandler(() {
+        if (mounted) {
+          setState(() => bottomLabel = null); // 読み終わりで下部メッセージを消す
+        }
+        _isSpeaking = false;
+        _dequeueAndSpeak(); // 次があれば続けて読む
+      });
+    } catch (_) {
+      _isSpeaking = false;
+    }
   }
 
   @override
@@ -372,7 +399,6 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
 
   @override
   Widget build(BuildContext context) {
-    // ✅ もう “無限ぐるぐる” を出さない。必要最小限だけ。
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(

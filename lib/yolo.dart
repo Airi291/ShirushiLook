@@ -10,7 +10,7 @@ class YoloService {
   late List<String> _labels;
 
   Future<void> loadModel() async {
-    // ラベル読込だけ先に（軽い）
+    // ラベル読込
     final raw = await rootBundle.loadString('assets/labels_mtsd21.txt');
     _labels = raw
         .split('\n')
@@ -18,7 +18,7 @@ class YoloService {
         .where((e) => e.isNotEmpty)
         .toList();
 
-    // まずは GPU をトライ、ダメなら CPU に自動フォールバック
+    // GPU、ダメなら CPU にする
     final options = InterpreterOptions()..threads = 2;
     try {
       // iOS/Android 共通：GPU Delegate
