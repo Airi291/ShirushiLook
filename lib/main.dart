@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 
 // ==== 英語ラベル → 日本語表示名 ====
 const Map<String, String> kJaName = {
@@ -86,14 +87,29 @@ class _DemoOverlayPageState extends State<DemoOverlayPage>
   CameraController? _cam;
   bool _ready = false;
 
+  final FlutterTts _tts = FlutterTts();
+
   List<String> topLabels = ['stop', 'speed_limit']; // 上部の文字
-  String? bottomLabel = 'stop'; // 下部の文字
+  String? bottomLabel = 'speed_limit'; // 下部の文字
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _init();
+    _setupTts();
+  }
+
+  void _setupTts() async {
+    await _tts.setLanguage("ja-JP"); // 日本語
+    await _tts.setSpeechRate(0.5); // 読み上げ速度
+    await _tts.setVolume(1.0);
+    await _tts.setPitch(1.0);
+  }
+
+  Future<void> _speak(String text) async {
+    await _tts.stop(); // 前の読み上げを止める
+    await _tts.speak(text);
   }
 
   Future<void> _init() async {
@@ -110,6 +126,11 @@ class _DemoOverlayPageState extends State<DemoOverlayPage>
     await _cam!.initialize();
     if (!mounted) return;
     setState(() => _ready = true);
+
+    // ★ カメラ準備ができたら bottomLabel の意味を読み上げる
+    if (bottomLabel != null && kMeaning[bottomLabel!] != null) {
+      _speak(kMeaning[bottomLabel!]!);
+    }
   }
 
   @override
@@ -128,6 +149,7 @@ class _DemoOverlayPageState extends State<DemoOverlayPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _cam?.dispose();
+    _tts.stop(); // ★TTSを終了
     super.dispose();
   }
 
@@ -147,7 +169,7 @@ class _DemoOverlayPageState extends State<DemoOverlayPage>
             // カメラ映像
             CameraPreview(_cam!),
 
-            // 上部：複数名
+            // 上部ラベル
             if (topLabels.isNotEmpty)
               Positioned(
                 top: 12,
@@ -195,7 +217,7 @@ class _DemoOverlayPageState extends State<DemoOverlayPage>
                 ),
               ),
 
-            // 下部：単一の意味
+            // 下部の意味
             if (bottomText != null)
               Positioned(
                 left: 24,
