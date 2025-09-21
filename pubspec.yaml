@@ -12,7 +12,8 @@ dependencies:
     sdk: flutter
   camera: ^0.11.0+2
   flutter_tts: ^4.0.2
-  tflite_flutter: ^0.11.0 
+  tflite_flutter: ^0.11.0
+  image: ^4.0.17
 
 dev_dependencies:
   flutter_test:
@@ -22,5 +23,8 @@ flutter:
   uses-material-design: true
 
   assets:
-    - assets/models/best_float32.tflite
     - assets/labels_mtsd21.txt
+    - assets/labels_mtsd21_ja.txt
+    - assets/models/best_float32.tflite
+    - assets/models/labels_mtsd_yolo21.txt
+    - assets/study/

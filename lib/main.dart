@@ -1,11 +1,14 @@
 // lib/main.dart
 import 'dart:async';
 import 'dart:math' as math;
-import 'yolo.dart';
+import 'dart:typed_data';
+
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:camera/camera.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+
+import 'yolo.dart';
 
 const Map<String, String> kJaName = {
   'stop': '一時停止',
@@ -61,7 +64,6 @@ Future<void> main() async {
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
   ]);
-
   runApp(const _App());
 }
 
@@ -122,7 +124,6 @@ class _EntryState extends State<_Entry> {
 
   @override
   Widget build(BuildContext context) {
-    // シンプルなプレースホルダー
     if (_loading) {
       return const Scaffold(
         backgroundColor: Colors.black,
@@ -144,16 +145,12 @@ class _EntryState extends State<_Entry> {
                   style: const TextStyle(color: Colors.white70),
                   textAlign: TextAlign.center),
               const SizedBox(height: 16),
-              ElevatedButton(
-                onPressed: _loadCameras,
-                child: const Text('再試行'),
-              )
+              ElevatedButton(onPressed: _loadCameras, child: const Text('再試行')),
             ],
           ),
         ),
       );
     }
-    // 取得できたら本画面へ
     return _CameraOverlayPage(cameras: _cams!);
   }
 }
@@ -170,6 +167,9 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     with WidgetsBindingObserver {
   CameraController? _cam;
   bool _ready = false;
+  bool _streamingStarted = false;
+
+  String _debugInfo = 'YOLO init…';
 
   final FlutterTts _tts = FlutterTts();
   final YoloService _yolo = YoloService();
@@ -185,10 +185,9 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
   }
 
   Future<void> _init() async {
-    await _initCamera(); // ① すぐプレビュー
-    Future.delayed(Duration(seconds: 2), _loadYoloInBackground);
-    await _setupTts(); // ② TTS
-    _loadYoloInBackground(); // ③ YOLO
+    await _initCamera();
+    unawaited(_loadYoloInBackground());
+    await _setupTts();
   }
 
   Future<void> _initCamera() async {
@@ -223,21 +222,19 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     if (!mounted) return;
     setState(() {
       _cam = ctrl;
-      _ready = true; // プレビュー表示OK
+      _ready = true;
     });
   }
 
-  void _loadYoloInBackground() {
-    unawaited(Future.microtask(() async {
-      try {
-        await _yolo.loadModel();
-        debugPrint('[YOLO] loaded');
-        if (!mounted) return;
-        _maybeStartStream();
-      } catch (e, st) {
-        debugPrint('[YOLO] load error: $e\n$st');
-      }
-    }));
+  Future<void> _loadYoloInBackground() async {
+    try {
+      await _yolo.loadModel();
+      if (!mounted) return;
+      setState(() => _debugInfo = _yolo.modelInfo());
+      _maybeStartStream();
+    } catch (e, st) {
+      debugPrint('[YOLO] load error: $e\n$st');
+    }
   }
 
   Future<void> _setupTts() async {
@@ -251,28 +248,87 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     }
   }
 
+  // YUV420 → RGB（連続 3ch バイト）
+  Uint8List _yuv420ToRgb(CameraImage image) {
+    final int w = image.width, h = image.height;
+
+    final yPlane = image.planes[0];
+    final uPlane = image.planes.length > 1 ? image.planes[1] : yPlane;
+    final vPlane = image.planes.length > 2 ? image.planes[2] : null;
+
+    // iOS(NV12) は U/V が交互で plane[1] に入ることがある。
+    final bool uvInterleaved =
+        vPlane == null || vPlane.bytes.isEmpty || vPlane.bytesPerRow == 0;
+
+    final int yRowStride = yPlane.bytesPerRow;
+    final int uvRowStride = uPlane.bytesPerRow;
+
+    // bytesPerPixel が null の端末があるのでデフォルト 2（NV12）でフォールバック
+    final int uvPixelStride = (uPlane.bytesPerPixel ?? (uvInterleaved ? 2 : 1));
+
+    final out = Uint8List(w * h * 3);
+
+    for (int y = 0; y < h; y++) {
+      final yOff = y * yRowStride;
+      final uvOff = (y >> 1) * uvRowStride;
+
+      for (int x = 0; x < w; x++) {
+        final int yp = yPlane.bytes[yOff + x];
+
+        int up, vp;
+        if (uvInterleaved) {
+          // NV12: plane[1] に [U,V,U,V,...]
+          final idx = (x >> 1) * uvPixelStride + uvOff;
+          up = uPlane.bytes[idx];
+          vp = uPlane.bytes[idx + 1];
+        } else {
+          // Android 典型: U/V が別プレーン
+          final idx = (x >> 1) * uvPixelStride + uvOff;
+          up = uPlane.bytes[idx];
+          vp = vPlane!.bytes[idx];
+        }
+
+        // YUV → RGB（BT.601 近似）
+        int r = (yp + 1.370705 * (vp - 128)).round();
+        int g = (yp - 0.337633 * (up - 128) - 0.698001 * (vp - 128)).round();
+        int b = (yp + 1.732446 * (up - 128)).round();
+
+        if (r < 0)
+          r = 0;
+        else if (r > 255) r = 255;
+        if (g < 0)
+          g = 0;
+        else if (g > 255) g = 255;
+        if (b < 0)
+          b = 0;
+        else if (b > 255) b = 255;
+
+        final o = (y * w + x) * 3;
+        out[o] = r;
+        out[o + 1] = g;
+        out[o + 2] = b;
+      }
+    }
+
+    return out;
+  }
+
   Future<void> _maybeStartStream() async {
+    if (_streamingStarted) return;
     if (!_yolo.isReady || _cam == null || !_cam!.value.isInitialized) return;
 
-    bool _isProcessing = false;
-    int _frameCount = 0;
-    int _lastMs = DateTime.now().millisecondsSinceEpoch;
+    _streamingStarted = true;
+    bool busy = false;
 
     try {
       await _cam!.startImageStream((CameraImage image) async {
-        _frameCount++;
-        if (_frameCount % 3 != 0) return; // 3 枚に 1 回だけ処理
-        final now = DateTime.now().millisecondsSinceEpoch;
-        if (now - _lastMs < 100) return; // 100ms に 1 回だけ処理
-        _lastMs = now;
-
-        if (_isProcessing) return;
-        _isProcessing = true;
+        if (busy) return;
+        busy = true;
         try {
-          final bytes = Uint8List.fromList(image.planes[0].bytes);
-          await _processFrame(bytes);
+          final rgb = _yuv420ToRgb(image);
+          await _processFrame(rgb, image.width, image.height);
         } finally {
-          _isProcessing = false;
+          busy = false;
         }
       });
     } catch (e) {
@@ -282,59 +338,54 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
 
   String? _lastSpoken;
   DateTime _lastSpeakTime = DateTime.fromMillisecondsSinceEpoch(0);
-  bool _isSpeaking = false;
-  final List<String> _speakQueue = [];
+  bool _speaking = false;
+  final List<String> _queue = [];
 
-  Future<void> _processFrame(Uint8List bytes) async {
+  Future<void> _processFrame(Uint8List rgbBytes, int width, int height) async {
     if (!_yolo.isReady) return;
-    final results = _yolo.runMock(bytes);
-    if (!mounted) return;
+
+    final results = _yolo.runFrame(rgbBytes, width, height, threshold: 0.6);
 
     setState(() {
       topLabels = results;
       bottomLabel = results.isNotEmpty ? results.first : null;
+      _debugInfo = _yolo.modelInfo();
     });
 
     if (bottomLabel != null) {
       final now = DateTime.now();
       final text = kMeaning[bottomLabel!];
-
       if (text != null) {
-        // 🔑 2秒クールダウン & 同じ標識を連呼しない
-        final isSameAsBefore = bottomLabel == _lastSpoken;
-        final isCooldownOver = now.difference(_lastSpeakTime).inSeconds >= 2;
-
-        if (!isSameAsBefore || isCooldownOver) {
+        final same = bottomLabel == _lastSpoken;
+        final cool = now.difference(_lastSpeakTime).inSeconds >= 2;
+        if (!same || cool) {
           _lastSpoken = bottomLabel;
           _lastSpeakTime = now;
-          _enqueueSpeak(text);
+          _enqueue(text);
         }
       }
     }
   }
 
-  void _enqueueSpeak(String text) {
-    _speakQueue.add(text);
-    if (!_isSpeaking) _dequeueAndSpeak();
+  void _enqueue(String text) {
+    _queue.add(text);
+    if (!_speaking) _dequeue();
   }
 
-  Future<void> _dequeueAndSpeak() async {
-    if (_speakQueue.isEmpty) return;
-    _isSpeaking = true;
-    final text = _speakQueue.removeAt(0);
-
+  Future<void> _dequeue() async {
+    if (_queue.isEmpty) return;
+    _speaking = true;
+    final text = _queue.removeAt(0);
     try {
-      await _tts.stop(); // 前の音声をキャンセル
+      await _tts.stop();
       await _tts.speak(text);
       _tts.setCompletionHandler(() {
-        if (mounted) {
-          setState(() => bottomLabel = null); // 読み終わりで下部メッセージを消す
-        }
-        _isSpeaking = false;
-        _dequeueAndSpeak(); // 次があれば続けて読む
+        if (mounted) setState(() => bottomLabel = null);
+        _speaking = false;
+        _dequeue();
       });
     } catch (_) {
-      _isSpeaking = false;
+      _speaking = false;
     }
   }
 
@@ -343,6 +394,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     final cam = _cam;
     if (cam == null) return;
     if (state == AppLifecycleState.inactive) {
+      _streamingStarted = false;
       await cam.dispose();
     } else if (state == AppLifecycleState.resumed) {
       setState(() => _ready = false);
@@ -354,6 +406,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _streamingStarted = false;
     _cam?.dispose();
     _tts.stop();
     super.dispose();
@@ -373,21 +426,17 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     }
   }
 
-  Widget _buildCameraFull() {
-    final c = _cam!;
-    if (!c.value.isInitialized) {
-      return const SizedBox.shrink();
-    }
+  Widget _cameraPreview() {
+    final c = _cam;
+    if (c == null || !c.value.isInitialized) return const SizedBox.shrink();
     final preview = c.value.previewSize!;
-    final rotatedW = preview.height;
-    final rotatedH = preview.width;
-
+    final w = preview.height, h = preview.width;
     return SizedBox.expand(
       child: FittedBox(
         fit: BoxFit.cover,
         child: SizedBox(
-          width: rotatedW,
-          height: rotatedH,
+          width: w,
+          height: h,
           child: Transform.rotate(
             angle: _rotationRad(),
             child: CameraPreview(c),
@@ -404,7 +453,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (_ready && _cam != null) _buildCameraFull(),
+          if (_ready && _cam != null) _cameraPreview(),
           if (!_ready)
             const Center(
               child:
@@ -423,9 +472,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
                       spacing: 6,
                       runSpacing: 6,
                       children: topLabels
-                          .map((k) => Chip(
-                                label: Text(kJaName[k] ?? k),
-                              ))
+                          .map((k) => Chip(label: Text(kJaName[k] ?? k)))
                           .toList(),
                     ),
                   ),
@@ -442,35 +489,52 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
                         borderRadius: BorderRadius.circular(8),
                         boxShadow: const [
                           BoxShadow(
-                              blurRadius: 6,
-                              color: Colors.black26,
-                              offset: Offset(0, 2))
+                            blurRadius: 6,
+                            color: Colors.black26,
+                            offset: Offset(0, 2),
+                          ),
                         ],
                       ),
                       child: Text(
                         kMeaning[bottomLabel!] ?? bottomLabel!,
                         textAlign: TextAlign.center,
                         style: const TextStyle(
-                            fontSize: 20,
-                            fontWeight: FontWeight.w700,
-                            color: Colors.red,
-                            letterSpacing: 1.2),
+                          fontSize: 20,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.red,
+                          letterSpacing: 1.2,
+                        ),
                       ),
                     ),
                   ),
-                // 右上に簡易リロード
                 Positioned(
                   top: 8,
                   right: 8,
-                  child: IconButton(
-                    color: Colors.white,
-                    icon: const Icon(Icons.refresh),
-                    onPressed: () async {
-                      setState(() => _ready = false);
-                      await _cam?.dispose();
-                      await _initCamera();
-                      _maybeStartStream();
-                    },
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 6),
+                        color: Colors.black54,
+                        child: Text(
+                          _debugInfo,
+                          style: const TextStyle(
+                              color: Colors.white, fontSize: 12),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton(
+                        color: Colors.white,
+                        icon: const Icon(Icons.refresh),
+                        onPressed: () async {
+                          setState(() => _ready = false);
+                          await _cam?.dispose();
+                          await _initCamera();
+                          _maybeStartStream();
+                        },
+                      ),
+                    ],
                   ),
                 ),
               ],
