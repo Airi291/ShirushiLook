@@ -22,18 +22,16 @@ class YoloService {
         .where((e) => e.isNotEmpty)
         .toList();
 
-    // デリゲート設定（iOS=Core ML / Android=GPU）→ 失敗時はCPUへ
     final options = InterpreterOptions()..threads = 2;
     try {
-      if (Platform.isIOS) {
-        options.addDelegate(CoreMlDelegate()); // ★ iOS
-        debugPrint('[YOLO] Core ML delegate enabled');
-      } else {
-        options.addDelegate(GpuDelegateV2()); // ★ Android
+      if (Platform.isAndroid) {
+        options.addDelegate(GpuDelegateV2()); // AndroidのみGPU
         debugPrint('[YOLO] GPU delegate enabled');
+      } else {
+        debugPrint('[YOLO] iOS: CPU 使用'); // iOSはまずCPUで安定化
       }
     } catch (e) {
-      debugPrint('[YOLO] delegate setup failed: $e (falling back to CPU)');
+      debugPrint('[YOLO] delegate setup failed: $e (CPU継続)');
     }
 
     try {
@@ -102,7 +100,7 @@ class YoloService {
     Uint8List rgbBytes,
     int srcW,
     int srcH, {
-    double threshold = 0.35,
+    double threshold = 0.50,
   }) {
     if (!isReady) return [];
 

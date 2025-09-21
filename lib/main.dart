@@ -2,12 +2,11 @@
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
-
+import 'dart:io' show Platform;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
-
 import 'yolo.dart';
 
 const Map<String, String> kJaName = {
@@ -165,6 +164,9 @@ class _CameraOverlayPage extends StatefulWidget {
 
 class _CameraOverlayPageState extends State<_CameraOverlayPage>
     with WidgetsBindingObserver {
+  Timer? _inferTimer;
+  CameraImage? _latestImage;
+  bool _busy = false;
   CameraController? _cam;
   bool _ready = false;
   bool _streamingStarted = false;
@@ -198,9 +200,10 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
 
     final ctrl = CameraController(
       back,
-      ResolutionPreset.low,
+      ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420,
+      imageFormatGroup:
+          Platform.isIOS ? ImageFormatGroup.bgra8888 : ImageFormatGroup.yuv420,
     );
 
     try {
@@ -250,21 +253,31 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
 
   // YUV420 → RGB（連続 3ch バイト）
   Uint8List _yuv420ToRgb(CameraImage image) {
-    final int w = image.width, h = image.height;
+    final w = image.width, h = image.height;
 
+    // Y / U / V プレーン（存在しない場合は null）
     final yPlane = image.planes[0];
-    final uPlane = image.planes.length > 1 ? image.planes[1] : yPlane;
-    final vPlane = image.planes.length > 2 ? image.planes[2] : null;
+    final uPlane = (image.planes.length >= 2) ? image.planes[1] : null;
+    final vPlane = (image.planes.length >= 3) ? image.planes[2] : null;
 
-    // iOS(NV12) は U/V が交互で plane[1] に入ることがある。
-    final bool uvInterleaved =
-        vPlane == null || vPlane.bytes.isEmpty || vPlane.bytesPerRow == 0;
+    // --- 形式判定 ---
+    // iOS 典型: NV12 = 2プレーン (Y と UV交互)
+    // Android 多い: 3プレーン (Y,U,V) ただし U/V が interleaved のこともある
+    bool isNV12 = image.planes.length == 2;
 
-    final int yRowStride = yPlane.bytesPerRow;
-    final int uvRowStride = uPlane.bytesPerRow;
+    // 3プレーンでも V が空/行幅0 なら実質 NV12 とみなす
+    if (!isNV12 &&
+        (vPlane == null || vPlane.bytes.isEmpty || vPlane.bytesPerRow == 0)) {
+      isNV12 = true;
+    }
 
-    // bytesPerPixel が null の端末があるのでデフォルト 2（NV12）でフォールバック
-    final int uvPixelStride = (uPlane.bytesPerPixel ?? (uvInterleaved ? 2 : 1));
+    // ストライド（ビットマップ上の1行のバイト数）
+    final yRowStride = yPlane.bytesPerRow;
+    final uvRowStride = (uPlane?.bytesPerRow ?? 0);
+
+    // U/V のピクセル間隔：NV12 は必ず 2（[U,V] が交互）
+    // I420/IYUV は 1 だが、端末によって null なのでフォールバック 1
+    final uvPixelStride = isNV12 ? 2 : (uPlane?.bytesPerPixel ?? 1);
 
     final out = Uint8List(w * h * 3);
 
@@ -273,22 +286,22 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
       final uvOff = (y >> 1) * uvRowStride;
 
       for (int x = 0; x < w; x++) {
-        final int yp = yPlane.bytes[yOff + x];
+        final yp = yPlane.bytes[yOff + x];
 
         int up, vp;
-        if (uvInterleaved) {
-          // NV12: plane[1] に [U,V,U,V,...]
+        if (isNV12) {
+          // plane[1] に [U,V,U,V,...]
           final idx = (x >> 1) * uvPixelStride + uvOff;
-          up = uPlane.bytes[idx];
+          up = uPlane!.bytes[idx];
           vp = uPlane.bytes[idx + 1];
         } else {
-          // Android 典型: U/V が別プレーン
+          // U/V 別プレーン
           final idx = (x >> 1) * uvPixelStride + uvOff;
-          up = uPlane.bytes[idx];
+          up = uPlane!.bytes[idx];
           vp = vPlane!.bytes[idx];
         }
 
-        // YUV → RGB（BT.601 近似）
+        // BT.601 近似
         int r = (yp + 1.370705 * (vp - 128)).round();
         int g = (yp - 0.337633 * (up - 128) - 0.698001 * (vp - 128)).round();
         int b = (yp + 1.732446 * (up - 128)).round();
@@ -313,27 +326,58 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     return out;
   }
 
+  Uint8List _toRgb(CameraImage image) {
+    if (image.format.group == ImageFormatGroup.bgra8888) {
+      // ★ iOS: BGRA → RGB（高速）
+      final w = image.width, h = image.height;
+      final plane = image.planes[0].bytes; // BGRA packed
+      final out = Uint8List(w * h * 3);
+      int j = 0;
+      for (int i = 0; i < plane.length; i += 4) {
+        final b = plane[i];
+        final g = plane[i + 1];
+        final r = plane[i + 2];
+        out[j++] = r;
+        out[j++] = g;
+        out[j++] = b;
+      }
+      return out;
+    } else {
+      return _yuv420ToRgb(image);
+    }
+  }
+
   Future<void> _maybeStartStream() async {
     if (_streamingStarted) return;
     if (!_yolo.isReady || _cam == null || !_cam!.value.isInitialized) return;
 
     _streamingStarted = true;
-    bool busy = false;
 
+    // 常に「最新」だけ保持
     try {
-      await _cam!.startImageStream((CameraImage image) async {
-        if (busy) return;
-        busy = true;
-        try {
-          final rgb = _yuv420ToRgb(image);
-          await _processFrame(rgb, image.width, image.height);
-        } finally {
-          busy = false;
-        }
+      await _cam!.startImageStream((CameraImage image) {
+        _latestImage = image;
       });
     } catch (e) {
       debugPrint('[Camera] startImageStream error: $e');
+      return;
     }
+
+    // 150msごとに最新フレームを処理（約6〜7FPS）
+    _inferTimer = Timer.periodic(const Duration(milliseconds: 150), (_) async {
+      if (_busy) return;
+      final img = _latestImage;
+      if (img == null) return;
+
+      _busy = true;
+      _latestImage = null; // 取り出したら捨てる（溜めない）
+      try {
+        final rgb = _toRgb(img);
+        await _processFrame(rgb, img.width, img.height);
+      } finally {
+        _busy = false;
+      }
+    });
   }
 
   String? _lastSpoken;
@@ -343,8 +387,27 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
 
   Future<void> _processFrame(Uint8List rgbBytes, int width, int height) async {
     if (!_yolo.isReady) return;
+    final Map<String, int> _streak = {};
+    final results = _yolo.runFrame(rgbBytes, width, height, threshold: 0.30);
 
-    final results = _yolo.runFrame(rgbBytes, width, height, threshold: 0.6);
+    // 連続ヒットで安定化
+    String? stable;
+    for (final k in results) {
+      _streak[k] = (_streak[k] ?? 0) + 1;
+      if (_streak[k]! >= 2) {
+        // 2フレーム続いたら採用（必要なら3に）
+        stable = k;
+      }
+    }
+    // 昇順リセット（出なかったラベルのカウントを少しずつ減衰）
+    _streak.keys.where((k) => !results.contains(k)).toList().forEach((k) {
+      final v = (_streak[k] ?? 0) - 1;
+      if (v <= 0) {
+        _streak.remove(k);
+      } else {
+        _streak[k] = v;
+      }
+    });
 
     setState(() {
       topLabels = results;
@@ -406,6 +469,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _inferTimer?.cancel();
     _streamingStarted = false;
     _cam?.dispose();
     _tts.stop();
@@ -462,7 +526,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
           SafeArea(
             child: Stack(
               children: [
-                if (topLabels.isNotEmpty)
+                if (_yolo.isReady && topLabels.isNotEmpty)
                   Positioned(
                     top: 12,
                     left: 24,
