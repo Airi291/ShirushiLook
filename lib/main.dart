@@ -13,6 +13,7 @@ import 'package:camera_macos/camera_macos_view.dart';
 import 'package:camera_macos/camera_macos.dart' show CameraMacOSMode;
 
 import 'yolo.dart';
+import 'dart:math' as math;
 
 /// ====== 表示名・読み上げ文言 ======
 const Map<String, String> kJaName = {
@@ -64,10 +65,10 @@ const Map<String, String> kMeaning = {
 };
 
 /// ====== チューニング用定数 ======
-const int kWarmupFrames = 12; // ウォームアップ（推論は捨てる）
-const int kStreakNeed = 2; // 何連続で「確定」とみなすか
-const int kClearAfterNoHit = 3; // 未検出が何フレーム続いたらUIを消すか
-const double kScoreThreshold = 0.65; // YOLOのスコア閾値
+const int kWarmupFrames = 12;
+const int kStreakNeed = 2;
+const int kClearAfterNoHit = 3;
+const double kScoreThreshold = 0.65;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -161,17 +162,60 @@ class _MacCameraPageState extends State<_MacCameraPage> {
     setState(() => _debugInfo = _yolo.modelInfo());
   }
 
-  // ARGB8888 -> RGB
-  Uint8List _argbToRgb(Uint8List argb, int w, int h) {
+// ARGB→RGBの後に使う：RGBを時計回り90°回転
+  Uint8List rotateRgbCW90(Uint8List src, int w, int h) {
+    // 出力は (幅=h, 高さ=w) だが画素数は同じなのでサイズは w*h*3 のままでOK
     final out = Uint8List(w * h * 3);
+    int di = 0;
+
+    // 目的座標 (x', y') に対し、元座標は (sx, sy) = (y', h - 1 - x')
+    for (int yOut = 0; yOut < w; yOut++) {
+      // 出力の高さ = w
+      for (int xOut = 0; xOut < h; xOut++) {
+        // 出力の幅   = h
+        final int sx = yOut;
+        final int sy = h - 1 - xOut;
+        final int si = (sy * w + sx) * 3;
+        out[di++] = src[si];
+        out[di++] = src[si + 1];
+        out[di++] = src[si + 2];
+      }
+    }
+    return out;
+  }
+
+  // ARGB8888 -> RGB
+  Uint8List _bytesToRgb(Uint8List src, int w, int h, {int? bytesPerRow}) {
+    final out = Uint8List(w * h * 3);
+    final stride = bytesPerRow ?? (w * 4);
+
+    // 並び推定（数十pixelだけ見て赤チャンネル位置を推測）
+    int redBGRA = 0, redARGB = 0;
+    final sample = math.min(64, (h * w));
+    for (int s = 0; s < sample; s++) {
+      final i = (s ~/ w) * stride + (s % w) * 4;
+      redBGRA += src[i + 2]; // BGRA の R
+      redARGB += src[i + 1]; // ARGB の R
+    }
+    final isBGRA = redBGRA >= redARGB;
+
     int j = 0;
-    for (int i = 0; i < argb.length; i += 4) {
-      final r = argb[i + 1];
-      final g = argb[i + 2];
-      final b = argb[i + 3];
-      out[j++] = r;
-      out[j++] = g;
-      out[j++] = b;
+    for (int y = 0; y < h; y++) {
+      final row = y * stride;
+      for (int x = 0; x < w; x++) {
+        final i = row + x * 4;
+        if (isBGRA) {
+          final b = src[i + 0], g = src[i + 1], r = src[i + 2];
+          out[j++] = r;
+          out[j++] = g;
+          out[j++] = b;
+        } else {
+          final r = src[i + 1], g = src[i + 2], b = src[i + 3];
+          out[j++] = r;
+          out[j++] = g;
+          out[j++] = b;
+        }
+      }
     }
     return out;
   }
@@ -342,24 +386,25 @@ class _MacCameraPageState extends State<_MacCameraPage> {
                   final Uint8List? bytes = data.bytes;
                   final int? w = data.width;
                   final int? h = data.height;
+                  // プラグインに bytesPerRow があれば使う（無ければ null でOK）
+                  final int? bpr = (data.bytesPerRow is int)
+                      ? data.bytesPerRow as int
+                      : null;
+
                   if (bytes == null || w == null || h == null) return;
 
                   _busy = true;
                   try {
-                    final rgb = _argbToRgb(bytes, w, h); // ← ここは non-null
-                    await _processFrame(rgb, w, h);
-
-                    // （任意）FPS 計測があるならここで続けてOK
-                    _framesSeen++;
-                    final now = DateTime.now();
-                    final ms = now.difference(_lastFpsAt).inMilliseconds;
-                    if (ms >= 1000) {
-                      setState(() {
-                        _fps = (_framesSeen - _framesSeenLast) / (ms / 1000.0);
-                        _framesSeenLast = _framesSeen;
-                        _lastFpsAt = now;
-                      });
+                    final rgb = _bytesToRgb(bytes, w, h, bytesPerRow: bpr);
+                    var results =
+                        _yolo.runFrame(rgb, w, h, threshold: kScoreThreshold);
+                    if (results.isEmpty) {
+                      final rgb90 = rotateRgbCW90(rgb, w, h);
+                      results = _yolo.runFrame(rgb90, h, w,
+                          threshold: kScoreThreshold);
                     }
+                    await _processFrame(rgb, w, h);
+                    // …FPS計測はそのまま…
                   } finally {
                     _busy = false;
                   }
