@@ -28,5 +28,8 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<!-- 追加（必須）：カメラ使用理由 -->
+	<key>NSCameraUsageDescription</key>
+	<string>道路標識を認識するためにカメラを使用します。</string>
 </dict>
 </plist>

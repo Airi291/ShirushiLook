@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:image/image.dart' as img;
 import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:flutter/foundation.dart' show listEquals, debugPrint;
 
 class YoloService {
   List<MapEntry<String, double>> lastTop = const [];
@@ -32,8 +33,10 @@ class YoloService {
       if (Platform.isAndroid) {
         options.addDelegate(GpuDelegateV2());
         debugPrint('[YOLO] GPU delegate enabled');
-      } else {
+      } else if (Platform.isIOS) {
         debugPrint('[YOLO] iOS: CPU 使用');
+      } else if (Platform.isMacOS) {
+        debugPrint('[YOLO] macOS: CPU 使用');
       }
     } catch (e) {
       debugPrint('[YOLO] delegate setup failed: $e (CPU継続)');
@@ -52,6 +55,15 @@ class YoloService {
         options: InterpreterOptions()..threads = 2,
       );
     }
+
+    // ★ ここを追加：入力テンソル形状を [1,640,640,3] に固定してから allocate
+    final want = [1, 640, 640, 3];
+    final cur = _interpreter.getInputTensor(0).shape;
+    if (!listEquals(cur, want)) {
+      debugPrint('[YOLO] resize input $cur -> $want');
+      _interpreter.resizeInputTensor(0, want);
+    }
+    _interpreter.allocateTensors();
 
     // モデル情報ログ
     try {
@@ -108,10 +120,7 @@ class YoloService {
     }
   }
 
-  /// 出力 shape = [1, 25, 8400] を想定
-  /// 閾値は一旦 0.15 に下げて様子見（後で上げ戻す）
-// lib/yolo.dart の runFrame を丸ごと置き換え
-  /// 出力 shape = [1, 25, 8400] を想定（= 4 + 21クラス）
+  // lib/yolo.dart の runFrame を差し替え
   List<String> runFrame(
     Uint8List rgbBytes,
     int srcW,
@@ -120,98 +129,105 @@ class YoloService {
   }) {
     if (!isReady) return [];
 
-    // === 計測 ===
+    // 前処理：RGB → 640x640 float32 [0,1] フラット
     final swPre = Stopwatch()..start();
-    final input = _preprocess(
-        rgbBytes, srcW, srcH); // pre_mean は _preprocess 内で lastDebugLine に入る
+    final Float32List inputFlat = _preprocess(rgbBytes, srcW, srcH);
     swPre.stop();
 
-    // 出力 shape
+    // 出力テンソル形状（期待: [1,25,8400]）
     final outT = _interpreter.getOutputTensor(0);
-    final outShape = outT.shape; // 期待: [1,25,8400]
-    if (outShape.length != 3 || outShape[1] < 5) {
+    final outShape = outT.shape;
+    if (outShape.length != 3 || outShape[0] != 1 || outShape[1] < 5) {
       lastDebugLine = 'bad shape: $outShape | $lastDebugLine';
       return [];
     }
-    final cDim = outShape[1]; // 25
-    final nBox = outShape[2]; // 8400
-    final numClasses = cDim - 4; // 21
+    final int b = outShape[0]; // 1
+    final int cDim = outShape[1]; // 25 (=4+21)
+    final int nBox = outShape[2]; // 8400
+    final int numClasses = cDim - 4;
 
-    // 受け皿（ListでOK）
-    final output = List.generate(
+    // ===== 入力 [1,640,640,3]（最内層は Float32List(3) のままでOK）=====
+    final List<List<List<Float32List>>> input4d =
+        List<List<List<Float32List>>>.generate(
       1,
-      (_) => List.generate(
-        cDim,
-        (_) => List<double>.filled(nBox, 0.0),
+      (_) => List<List<Float32List>>.generate(
+        640,
+        (y) => List<Float32List>.generate(
+          640,
+          (x) {
+            final base = (y * 640 + x) * 3;
+            final f = Float32List(3);
+            f[0] = inputFlat[base + 0];
+            f[1] = inputFlat[base + 1];
+            f[2] = inputFlat[base + 2];
+            return f;
+          },
+          growable: false,
+        ),
+        growable: false,
       ),
+      growable: false,
+    );
+
+    // ===== 出力 [1, cDim, nBox]（最内層は List<double> にする！）=====
+    final List<List<List<double>>> output = List<List<List<double>>>.generate(
+      b, // =1
+      (_) => List<List<double>>.generate(
+        cDim,
+        (_) => List<double>.filled(nBox, 0.0, growable: false),
+        growable: false,
+      ),
+      growable: false,
     );
 
     // 推論
     final swInfer = Stopwatch()..start();
-    _interpreter.run(
-      input.buffer.asFloat32List().reshape([1, 640, 640, 3]),
-      output,
-    );
+    _interpreter.run(input4d, output);
     swInfer.stop();
 
     // 後処理
     final swPost = Stopwatch()..start();
-
-    // logit 範囲を見る（ゼロ地獄チェック）
-    double minLogit = double.infinity, maxLogit = -double.infinity;
-    for (int i = 0; i < nBox; i++) {
-      for (int c = 0; c < numClasses; c++) {
-        final v = output[0][4 + c][i];
-        if (v < minLogit) minLogit = v;
-        if (v > maxLogit) maxLogit = v;
-      }
-    }
-
-    // obj なしモデル想定：各クラスに sigmoid
     double sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
 
+    double minLogit = double.infinity, maxLogit = -double.infinity;
     final scored = <(int boxIdx, int classIdx, double score)>[];
+
     for (int i = 0; i < nBox; i++) {
-      double best = -1;
+      double best = -1.0;
       int bestIdx = -1;
       for (int c = 0; c < numClasses; c++) {
-        final logit = output[0][4 + c][i];
-        final prob = sigmoid(logit);
-        if (prob > best) {
-          best = prob;
+        final double logit = output[0][4 + c][i]; // [batch=0][class][index]
+        if (logit < minLogit) minLogit = logit;
+        if (logit > maxLogit) maxLogit = logit;
+        final p = sigmoid(logit);
+        if (p > best) {
+          best = p;
           bestIdx = c;
         }
       }
       if (bestIdx >= 0) scored.add((i, bestIdx, best));
     }
 
-    // スコア順
+    // スコア降順 & ラベル別最高のみ
     scored.sort((a, b) => b.$3.compareTo(a.$3));
-
-    // 各クラス名ごとの最高スコアを集計（threshold もここで適用）
     final Map<String, double> bestByLabel = {};
     for (final s in scored) {
-      final idx = s.$2;
-      if (idx < 0 || idx >= _labels.length) continue;
-      final label = _labels[idx];
+      final cls = s.$2;
+      if (cls < 0 || cls >= _labels.length) continue;
+      final label = _labels[cls];
       final score = s.$3;
       if (score >= threshold) {
         final prev = bestByLabel[label];
         if (prev == null || score > prev) bestByLabel[label] = score;
       } else {
-        // 以降はスコアが下がるので打ち切り（任意）
         break;
       }
     }
 
-    // UI で使う上位表示用ソート済みリストを保存
     lastTop = bestByLabel.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
-
-    // 返却用（ユニークなラベル一覧）
     final unique = bestByLabel.keys.toSet();
 
-    // デバッグ用 top3 表示
     final top3Dbg = lastTop
         .take(3)
         .map((e) => '${e.key}(${e.value.toStringAsFixed(2)})')

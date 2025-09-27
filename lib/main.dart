@@ -1,13 +1,16 @@
 // lib/main.dart
 import 'dart:async';
-import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:io' show Platform;
 
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+
+// macOS カメラ（camera_macos ^0.0.9 想定）
+import 'package:camera_macos/camera_macos_controller.dart';
+import 'package:camera_macos/camera_macos_view.dart';
+import 'package:camera_macos/camera_macos.dart' show CameraMacOSMode;
 
 import 'yolo.dart';
 
@@ -62,7 +65,6 @@ const Map<String, String> kMeaning = {
 
 /// ====== チューニング用定数 ======
 const int kWarmupFrames = 12; // ウォームアップ（推論は捨てる）
-const int kInferIntervalMs = 150; // 推論間隔（約6-7FPS）
 const int kStreakNeed = 2; // 何連続で「確定」とみなすか
 const int kClearAfterNoHit = 3; // 未検出が何フレーム続いたらUIを消すか
 const double kScoreThreshold = 0.65; // YOLOのスコア閾値
@@ -87,331 +89,100 @@ class _App extends StatelessWidget {
   }
 }
 
-class _Entry extends StatefulWidget {
+class _Entry extends StatelessWidget {
   const _Entry({super.key});
   @override
-  State<_Entry> createState() => _EntryState();
-}
-
-class _EntryState extends State<_Entry> {
-  List<CameraDescription>? _cams;
-  String? _error;
-  bool _loading = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadCameras();
-  }
-
-  Future<void> _loadCameras() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    try {
-      final cams = await Future.any<List<CameraDescription>>([
-        availableCameras(),
-        Future<List<CameraDescription>>.delayed(
-          const Duration(seconds: 6),
-          () => throw TimeoutException('availableCameras timeout'),
-        ),
-      ]);
-      if (!mounted) return;
-      setState(() {
-        _cams = cams;
-        _loading = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _error = e.toString();
-        _loading = false;
-      });
-    }
-  }
-
-  @override
   Widget build(BuildContext context) {
-    if (_loading) {
-      return const Scaffold(
-        backgroundColor: Colors.black,
-        body: Center(
-            child: Text('カメラ初期化中...', style: TextStyle(color: Colors.white))),
-      );
+    if (Platform.isMacOS) {
+      return const _MacCameraPage();
     }
-    if (_error != null) {
-      return Scaffold(
-        backgroundColor: Colors.black,
-        body: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text('カメラ初期化に失敗しました',
-                  style: TextStyle(color: Colors.white)),
-              const SizedBox(height: 8),
-              Text(_error!,
-                  style: const TextStyle(color: Colors.white70),
-                  textAlign: TextAlign.center),
-              const SizedBox(height: 16),
-              ElevatedButton(onPressed: _loadCameras, child: const Text('再試行')),
-            ],
-          ),
+    // macOS以外では簡易メッセージのみ（iOS/Android 実装は今回は省略）
+    return const Scaffold(
+      backgroundColor: Colors.black,
+      body: Center(
+        child: Text(
+          'このビルドは macOS 専用です（iOS/Android ページは未同梱）',
+          style: TextStyle(color: Colors.white70),
         ),
-      );
-    }
-    return _CameraOverlayPage(cameras: _cams!);
+      ),
+    );
   }
 }
 
-class _CameraOverlayPage extends StatefulWidget {
-  final List<CameraDescription> cameras;
-  const _CameraOverlayPage({super.key, required this.cameras});
-
+/// =====================
+/// macOS カメラ + YOLO
+/// =====================
+class _MacCameraPage extends StatefulWidget {
+  const _MacCameraPage({super.key});
   @override
-  State<_CameraOverlayPage> createState() => _CameraOverlayPageState();
+  State<_MacCameraPage> createState() => _MacCameraPageState();
 }
 
-class _CameraOverlayPageState extends State<_CameraOverlayPage>
-    with WidgetsBindingObserver {
-  // ===== デバッグHUD用 =====
-  bool _debugHud = false; // 必要に応じて切替
-  int _framesSeen = 0;
-  int _framesSeenLast = 0;
-  double _fps = 0;
-  DateTime _lastFpsAt = DateTime.now();
-  int _resultsCount = 0;
-  String _last3 = "";
+class _MacCameraPageState extends State<_MacCameraPage> {
+  final YoloService _yolo = YoloService();
+  final FlutterTts _tts = FlutterTts();
 
-  // ===== 状態 =====
-  int _warmupLeft = kWarmupFrames; // ウォームアップ残りフレーム
-  int _noHitFrames = 0; // 未検出が続いたフレーム数
-  final Map<String, int> _streak = {}; // 連続ヒット数（クラス別） ← フィールドにするのが重要！
-
-  Timer? _inferTimer;
-  CameraImage? _latestImage;
+  CameraMacOSController? _ctrl;
   bool _busy = false;
-  CameraController? _cam;
-  bool _ready = false;
-  bool _streamingStarted = false;
 
+  // 安定化・UI 状態
+  int _warmupLeft = kWarmupFrames;
+  int _noHitFrames = 0;
+  final Map<String, int> _streak = {};
+  bool _hasDetection = false;
+  List<String> _topLabels = [];
+  String? _bottomLabel;
+
+  // TTS
+  bool _speaking = false;
+  final List<String> _queue = [];
+  String? _lastSpoken;
+  DateTime _lastSpeakTime = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // fps/HUD
+  double _fps = 0;
+  int _framesSeen = 0, _framesSeenLast = 0;
+  DateTime _lastFpsAt = DateTime.now();
   String _debugInfo = 'YOLO init…';
 
-  final FlutterTts _tts = FlutterTts();
-  final YoloService _yolo = YoloService();
-
-  bool _hasDetection = false; // 上部チップ列の表示判定
-  List<String> topLabels = [];
-  String? bottomLabel; // 安定化して確定した1件
-
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _init();
   }
 
   Future<void> _init() async {
-    await _initCamera();
-    unawaited(_loadYoloInBackground());
-    await _setupTts();
+    await _tts.setLanguage("ja-JP");
+    await _tts.setSpeechRate(0.5);
+    await _tts.setVolume(1.0);
+    await _tts.setPitch(1.0);
+
+    await _yolo.loadModel();
+    setState(() => _debugInfo = _yolo.modelInfo());
   }
 
-  Future<void> _initCamera() async {
-    final back = widget.cameras.firstWhere(
-      (c) => c.lensDirection == CameraLensDirection.back,
-      orElse: () => widget.cameras.first,
-    );
-
-    final ctrl = CameraController(
-      back,
-      ResolutionPreset.medium,
-      enableAudio: false,
-      imageFormatGroup:
-          Platform.isIOS ? ImageFormatGroup.bgra8888 : ImageFormatGroup.yuv420,
-    );
-
-    try {
-      await Future.any([
-        ctrl.initialize(),
-        Future.delayed(const Duration(seconds: 6),
-            () => throw TimeoutException('camera initialize timeout')),
-      ]);
-    } catch (e) {
-      debugPrint('[Camera] initialize error: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('カメラ初期化に時間がかかっています。右上から再起動してください。')),
-        );
-      }
-      return;
-    }
-
-    if (!mounted) return;
-    setState(() {
-      _cam = ctrl;
-      _ready = true;
-    });
-  }
-
-  Future<void> _loadYoloInBackground() async {
-    try {
-      await _yolo.loadModel();
-      if (!mounted) return;
-      setState(() => _debugInfo = _yolo.modelInfo());
-      _maybeStartStream();
-    } catch (e, st) {
-      debugPrint('[YOLO] load error: $e\n$st');
-    }
-  }
-
-  Future<void> _setupTts() async {
-    try {
-      await _tts.setLanguage("ja-JP");
-      await _tts.setSpeechRate(0.5);
-      await _tts.setVolume(1.0);
-      await _tts.setPitch(1.0);
-    } catch (e) {
-      debugPrint('[TTS] setup error: $e');
-    }
-  }
-
-  // ====== フォーマット変換 ======
-  Uint8List _yuv420ToRgb(CameraImage image) {
-    final w = image.width, h = image.height;
-
-    final yPlane = image.planes[0];
-    final uPlane = (image.planes.length >= 2) ? image.planes[1] : null;
-    final vPlane = (image.planes.length >= 3) ? image.planes[2] : null;
-
-    bool isNV12 = image.planes.length == 2;
-    if (!isNV12 &&
-        (vPlane == null || vPlane.bytes.isEmpty || vPlane.bytesPerRow == 0)) {
-      isNV12 = true;
-    }
-
-    final yRowStride = yPlane.bytesPerRow;
-    final uvRowStride = (uPlane?.bytesPerRow ?? 0);
-    final uvPixelStride = isNV12 ? 2 : (uPlane?.bytesPerPixel ?? 1);
-
+  // ARGB8888 -> RGB
+  Uint8List _argbToRgb(Uint8List argb, int w, int h) {
     final out = Uint8List(w * h * 3);
-
-    for (int y = 0; y < h; y++) {
-      final yOff = y * yRowStride;
-      final uvOff = (y >> 1) * uvRowStride;
-
-      for (int x = 0; x < w; x++) {
-        final yp = yPlane.bytes[yOff + x];
-
-        int up, vp;
-        if (isNV12) {
-          final idx = (x >> 1) * uvPixelStride + uvOff;
-          up = uPlane!.bytes[idx];
-          vp = uPlane.bytes[idx + 1];
-        } else {
-          final idx = (x >> 1) * uvPixelStride + uvOff;
-          up = uPlane!.bytes[idx];
-          vp = vPlane!.bytes[idx];
-        }
-
-        // BT.601 近似
-        int r = (yp + 1.370705 * (vp - 128)).round();
-        int g = (yp - 0.337633 * (up - 128) - 0.698001 * (vp - 128)).round();
-        int b = (yp + 1.732446 * (up - 128)).round();
-
-        r = r.clamp(0, 255);
-        g = g.clamp(0, 255);
-        b = b.clamp(0, 255);
-
-        final o = (y * w + x) * 3;
-        out[o] = r;
-        out[o + 1] = g;
-        out[o + 2] = b;
-      }
+    int j = 0;
+    for (int i = 0; i < argb.length; i += 4) {
+      final r = argb[i + 1];
+      final g = argb[i + 2];
+      final b = argb[i + 3];
+      out[j++] = r;
+      out[j++] = g;
+      out[j++] = b;
     }
     return out;
   }
 
-  Uint8List _toRgb(CameraImage image) {
-    if (image.format.group == ImageFormatGroup.bgra8888) {
-      // iOS: BGRA → RGB
-      final w = image.width, h = image.height;
-      final plane = image.planes[0].bytes;
-      final out = Uint8List(w * h * 3);
-      int j = 0;
-      for (int i = 0; i < plane.length; i += 4) {
-        final b = plane[i];
-        final g = plane[i + 1];
-        final r = plane[i + 2];
-        out[j++] = r;
-        out[j++] = g;
-        out[j++] = b;
-      }
-      return out;
-    }
-    return _yuv420ToRgb(image);
-  }
-
-  // ====== ストリーム開始 ======
-// ====== ストリーム開始 ======
-  Future<void> _maybeStartStream() async {
-    if (_streamingStarted) return;
-    if (!_yolo.isReady || _cam == null || !_cam!.value.isInitialized) return;
-
-    _streamingStarted = true;
-
-    try {
-      await _cam!.startImageStream((CameraImage image) {
-        _latestImage = image; // 最新のみキープ
-      });
-    } catch (e) {
-      debugPrint('[Camera] startImageStream error: $e');
-      return;
-    }
-
-    _inferTimer = Timer.periodic(const Duration(milliseconds: kInferIntervalMs),
-        (_) async {
-      if (_busy) return;
-      final img = _latestImage;
-      if (img == null) return;
-
-      _busy = true;
-      _latestImage = null;
-      try {
-        final rgb = _toRgb(img);
-        await _processFrame(rgb, img.width, img.height);
-
-        // === 追加: FPS 計測 ===
-        _framesSeen++;
-        final now = DateTime.now();
-        final ms = now.difference(_lastFpsAt).inMilliseconds;
-        if (ms >= 1000) {
-          _fps = (_framesSeen - _framesSeenLast) / (ms / 1000.0);
-          _framesSeenLast = _framesSeen;
-          _lastFpsAt = now;
-        }
-      } finally {
-        _busy = false;
-      }
-    });
-  }
-
-  // ====== 推論＆UI更新 ======
-  String? _lastSpoken;
-  DateTime _lastSpeakTime = DateTime.fromMillisecondsSinceEpoch(0);
-  bool _speaking = false;
-  final List<String> _queue = [];
-
   Future<void> _processFrame(Uint8List rgbBytes, int width, int height) async {
-    if (!_yolo.isReady) return;
-
-    // ウォームアップ処理
     if (_warmupLeft > 0) {
       _warmupLeft--;
       if (_warmupLeft == 0) {
         setState(() {
-          topLabels = [];
-          bottomLabel = null;
+          _topLabels = [];
+          _bottomLabel = null;
           _hasDetection = false;
         });
       }
@@ -421,22 +192,23 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     final results =
         _yolo.runFrame(rgbBytes, width, height, threshold: kScoreThreshold);
 
-    // ---- 上位3件（閾値以上）を表示用に抽出 ----
-    final top3Entries =
-        _yolo.lastTop.where((e) => e.value >= kScoreThreshold).take(3).toList();
+    final top3 = _yolo.lastTop
+        .where((e) => e.value >= kScoreThreshold)
+        .take(3)
+        .map((e) => e.key)
+        .toList();
 
-    // 上部チップに出す英語ラベル配列
-    final top3Labels = top3Entries.map((e) => e.key).toList();
-
-    // HUD に出す日本語の短い文字列
-    final hudKindsShort = top3Labels.map((k) => kJaName[k] ?? k).join(', ');
-
-    // ③ 連続ヒットによる安定化
     String? stable;
     if (results.isEmpty) {
       _noHitFrames++;
       _streak.updateAll((_, v) => v > 0 ? v - 1 : 0);
-      if (_noHitFrames >= kClearAfterNoHit) _clearTopAndBottom();
+      if (_noHitFrames >= kClearAfterNoHit) {
+        setState(() {
+          _hasDetection = false;
+          _topLabels = [];
+          _bottomLabel = null;
+        });
+      }
     } else {
       _noHitFrames = 0;
       for (final k in results) {
@@ -456,23 +228,14 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
       _hasDetection = results.isNotEmpty;
     }
 
-    // ④ UI 更新（stable が宣言された後に参照）
-    if (mounted) {
-      setState(() {
-        // 上部は上位3件のみ
-        topLabels = top3Labels;
+    if (!mounted) return;
+    setState(() {
+      _topLabels = top3;
+      if (stable != null) _bottomLabel = stable;
+      _debugInfo = 'fps=${_fps.toStringAsFixed(1)} | ${_yolo.modelInfo()}\n'
+          '${_yolo.lastDebugLine}';
+    });
 
-        // 下段は従来どおり安定化した1件
-        bottomLabel = stable ?? bottomLabel;
-
-        // HUD 表示（hits も上部表示に合わせる）
-        _debugInfo = 'hits: ${top3Labels.length} | $hudKindsShort\n'
-            '${_yolo.modelInfo()}\n'
-            '${_yolo.lastDebugLine}';
-      });
-    }
-
-    // ⑤ TTS
     if (stable != null) {
       final text = kMeaning[stable];
       if (text != null) {
@@ -486,23 +249,6 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
         }
       }
     }
-
-    // ⑥ 長く未検出が続いたら下段も消す
-    if (_noHitFrames >= kClearAfterNoHit && bottomLabel != null) {
-      setState(() {
-        bottomLabel = null;
-        _hasDetection = false;
-      });
-    }
-  }
-
-  void _clearTopAndBottom() {
-    if (!mounted) return;
-    setState(() {
-      topLabels = [];
-      bottomLabel = null;
-      _hasDetection = false;
-    });
   }
 
   void _enqueue(String text) {
@@ -518,7 +264,7 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
       await _tts.stop();
       await _tts.speak(text);
       _tts.setCompletionHandler(() {
-        if (mounted) setState(() => bottomLabel = null);
+        if (mounted) setState(() => _bottomLabel = null);
         _speaking = false;
         _dequeue();
       });
@@ -527,166 +273,114 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
     }
   }
 
-  // ====== ライフサイクル ======
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) async {
-    final cam = _cam;
-    if (cam == null) return;
-    if (state == AppLifecycleState.inactive) {
-      _streamingStarted = false;
-      await cam.dispose();
-    } else if (state == AppLifecycleState.resumed) {
-      setState(() => _ready = false);
-      await _initCamera();
-      _maybeStartStream();
-    }
-  }
-
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _inferTimer?.cancel();
-    _streamingStarted = false;
-    _cam?.dispose();
-    _tts.stop();
-    super.dispose();
-  }
-
-  // ====== UI ======
-  double _rotationRad() {
-    if (_cam == null) return 0;
-    switch (_cam!.value.deviceOrientation) {
-      case DeviceOrientation.landscapeLeft:
-        return 0;
-      case DeviceOrientation.landscapeRight:
-        return math.pi;
-      case DeviceOrientation.portraitUp:
-        return -math.pi / 2;
-      case DeviceOrientation.portraitDown:
-        return math.pi / 2;
-    }
-  }
-
-  Widget _cameraPreview() {
-    final c = _cam;
-    if (c == null || !c.value.isInitialized) return const SizedBox.shrink();
-    final preview = c.value.previewSize!;
-    final w = preview.height, h = preview.width;
-    return SizedBox.expand(
-      child: FittedBox(
-        fit: BoxFit.cover,
-        child: SizedBox(
-          width: w,
-          height: h,
-          child: Transform.rotate(
-            angle: _rotationRad(),
-            child: CameraPreview(c),
-          ),
-        ),
-      ),
-    );
-  }
-
-  void _resetStabilizationState() {
-    // HUD リセット
-    _framesSeen = 0;
-    _framesSeenLast = 0;
-    _fps = 0;
-    _lastFpsAt = DateTime.now();
-    _resultsCount = 0;
-    _last3 = "";
-  }
-
   @override
   Widget build(BuildContext context) {
+    final chips = _hasDetection && _topLabels.isNotEmpty
+        ? Positioned(
+            top: 12,
+            left: 24,
+            right: 24,
+            child: Wrap(
+              alignment: WrapAlignment.center,
+              spacing: 6,
+              runSpacing: 6,
+              children: _topLabels
+                  .map((k) => Chip(label: Text(kJaName[k] ?? k)))
+                  .toList(),
+            ),
+          )
+        : const SizedBox.shrink();
+
+    final bottom = _bottomLabel != null
+        ? Positioned(
+            left: 24,
+            right: 24,
+            bottom: 16,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(8),
+                boxShadow: const [
+                  BoxShadow(
+                      blurRadius: 6,
+                      color: Colors.black26,
+                      offset: Offset(0, 2))
+                ],
+              ),
+              child: Text(
+                kMeaning[_bottomLabel!] ?? _bottomLabel!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.red),
+              ),
+            ),
+          )
+        : const SizedBox.shrink();
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (_ready && _cam != null) _cameraPreview(),
-          if (!_ready)
-            const Center(
-                child: Text('プレビュー準備中...',
-                    style: TextStyle(color: Colors.white70))),
+          // CameraMacOSView：初期化時に controller を受け取り、画像ストリーム開始
+          CameraMacOSView(
+              key: const ValueKey('macCamera'),
+              cameraMode: CameraMacOSMode.video,
+              fit: BoxFit.cover,
+              onCameraInizialized: (controller) async {
+                _ctrl = controller;
+
+                await _ctrl!.startImageStream((imageData) async {
+                  // まず imageData 自体の null を弾く
+                  final data = imageData;
+                  if (_busy || !_yolo.isReady || data == null) return;
+
+                  // ここで全部取り出して null チェック
+                  final Uint8List? bytes = data.bytes;
+                  final int? w = data.width;
+                  final int? h = data.height;
+                  if (bytes == null || w == null || h == null) return;
+
+                  _busy = true;
+                  try {
+                    final rgb = _argbToRgb(bytes, w, h); // ← ここは non-null
+                    await _processFrame(rgb, w, h);
+
+                    // （任意）FPS 計測があるならここで続けてOK
+                    _framesSeen++;
+                    final now = DateTime.now();
+                    final ms = now.difference(_lastFpsAt).inMilliseconds;
+                    if (ms >= 1000) {
+                      setState(() {
+                        _fps = (_framesSeen - _framesSeenLast) / (ms / 1000.0);
+                        _framesSeenLast = _framesSeen;
+                        _lastFpsAt = now;
+                      });
+                    }
+                  } finally {
+                    _busy = false;
+                  }
+                });
+              }),
           SafeArea(
             child: Stack(
               children: [
-                if (_hasDetection && topLabels.isNotEmpty)
-                  Positioned(
-                    top: 12,
-                    left: 24,
-                    right: 24,
-                    child: Wrap(
-                      alignment: WrapAlignment.center,
-                      spacing: 6,
-                      runSpacing: 6,
-                      children: topLabels
-                          .map((k) => Chip(label: Text(kJaName[k] ?? k)))
-                          .toList(),
-                    ),
-                  ),
-                if (bottomLabel != null)
-                  Positioned(
-                    left: 24,
-                    right: 24,
-                    bottom: 16,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 16, vertical: 12),
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        borderRadius: BorderRadius.circular(8),
-                        boxShadow: const [
-                          BoxShadow(
-                              blurRadius: 6,
-                              color: Colors.black26,
-                              offset: Offset(0, 2))
-                        ],
-                      ),
-                      child: Text(
-                        kMeaning[bottomLabel!] ?? bottomLabel!,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.w700,
-                          color: Colors.red,
-                          letterSpacing: 1.2,
-                        ),
-                      ),
-                    ),
-                  ),
+                chips,
+                bottom,
                 Positioned(
                   top: 8,
                   right: 8,
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 6),
-                        color: Colors.black54,
-                        // child: Text(
-                        //   _debugHud
-                        //       ? 'fps=${_fps.toStringAsFixed(1)}  warmup=$_warmupLeft  '
-                        //           'hits=$_resultsCount  top3=$_last3\n$_debugInfo'
-                        //       : _debugInfo,
-                        //   style: const TextStyle(
-                        //       color: Colors.white, fontSize: 12),
-                        // ),
-                      ),
-                      const SizedBox(width: 8),
-                      IconButton(
-                        color: Colors.white,
-                        icon: const Icon(Icons.refresh),
-                        onPressed: () async {
-                          setState(_resetStabilizationState);
-                          await _cam?.dispose();
-                          await _initCamera();
-                          _maybeStartStream();
-                        },
-                      ),
-                    ],
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                    color: Colors.black54,
+                    child: Text(
+                      _debugInfo,
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                    ),
                   ),
                 ),
               ],
@@ -695,5 +389,13 @@ class _CameraOverlayPageState extends State<_CameraOverlayPage>
         ],
       ),
     );
+  }
+
+  @override
+  void dispose() {
+    _ctrl?.stopImageStream();
+    // 一部バージョンには dispose() が無いので呼ばない
+    _tts.stop();
+    super.dispose();
   }
 }

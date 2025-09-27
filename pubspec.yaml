@@ -11,9 +11,10 @@ dependencies:
   flutter:
     sdk: flutter
   camera: ^0.11.0+2
+  camera_macos: ^0.0.9
   flutter_tts: ^4.0.2
   tflite_flutter: ^0.11.0
-  image: ^4.0.17
+  image: ^4.2.0
 
 dev_dependencies:
   flutter_test:

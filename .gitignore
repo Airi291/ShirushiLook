@@ -44,3 +44,8 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 assets/study/*.mp4
+lib/*.dylib
+lib/*.so
+lib/*.dll
+*.tar.gz
+macos/Runner/Resources/libtensorflowlite_c-mac.dylib
