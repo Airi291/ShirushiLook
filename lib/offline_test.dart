@@ -4,7 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:image/image.dart' as img;
-import 'yolo.dart';
+import 'demo_yolo.dart';
 
 void main() {
   runApp(const MaterialApp(

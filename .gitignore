@@ -49,3 +49,7 @@ lib/*.so
 lib/*.dll
 *.tar.gz
 macos/Runner/Resources/libtensorflowlite_c-mac.dylib
+assets/*.mp4
+assets/*.mov
+assets/*.mp4
+assets/*.mov
