@@ -1,7 +1,6 @@
 // lib/main.dart
 import 'dart:async';
 import 'dart:typed_data';
-import 'dart:io' show Platform;
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -14,7 +13,7 @@ import 'package:camera_macos/camera_macos.dart' show CameraMacOSMode;
 
 import 'yolo.dart';
 
-/// ====== 表示名・読み上げ文言 ======
+/// 表示名と読み上げ文言
 const Map<String, String> kJaName = {
   'stop': '一時停止',
   'yield': '一時停止',
@@ -63,24 +62,19 @@ const Map<String, String> kMeaning = {
   'parking': '駐車できます。周囲安全を確認。',
 };
 
-/// ====== チューニング用定数 ======
+/// 調整用
 const int kWarmupFrames = 8;
 const int kClearAfterNoHit = 3;
 const double kScoreThreshold = 0.65;
-
-/// 推論を間引く間隔（ms）: プレビューは常時描画、推論だけ間引く
-const int kInferEveryMs = 120; // ~8fps 推論
-
-/// UI トグル
-const bool kShowDebugHud = false; // 右上の詳細HUD
-const bool kShowChips = true; // 上部の検出チップ
+const int kInferEveryMsInit = 120;
+const bool kShowDebugHud = false;
+const bool kShowChips = true;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await SystemChrome.setPreferredOrientations([
-    DeviceOrientation.landscapeLeft,
-    DeviceOrientation.landscapeRight,
-  ]);
+  await SystemChrome.setPreferredOrientations(
+    [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight],
+  );
   runApp(const _App());
 }
 
@@ -90,35 +84,19 @@ class _App extends StatelessWidget {
   Widget build(BuildContext context) {
     return const MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: _Entry(),
+      home: _MacCameraPage(),
     );
   }
 }
 
-class _Entry extends StatelessWidget {
-  const _Entry({super.key});
-  @override
-  Widget build(BuildContext context) {
-    if (Platform.isMacOS) return const _MacCameraPage();
-    return const Scaffold(
-      backgroundColor: Colors.black,
-      body: Center(
-        child:
-            Text('このビルドは macOS 専用です', style: TextStyle(color: Colors.white70)),
-      ),
-    );
-  }
-}
-
-/// ====== 赤枠オーバーレイ ======
+/// 検出ボックスの描画
 class _BoxPainter extends CustomPainter {
   final List<YoloDetection> dets;
-  final Size srcSize; // 生フレームのサイズ（w,h）
+  final Size srcSize;
   _BoxPainter(this.dets, this.srcSize);
 
   @override
   void paint(Canvas canvas, Size size) {
-    // CameraMacOSView は cover なのでスケールとオフセット
     final scale =
         math.max(size.width / srcSize.width, size.height / srcSize.height);
     final dx = (size.width - srcSize.width * scale) / 2.0;
@@ -126,8 +104,8 @@ class _BoxPainter extends CustomPainter {
 
     final stroke = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 3
-      ..color = const Color(0xFFFF3B30); // 赤
+      ..strokeWidth = 2
+      ..color = const Color(0xFFFF3B30);
     final fill = Paint()..color = const Color(0xAA000000);
 
     for (final d in dets) {
@@ -139,32 +117,35 @@ class _BoxPainter extends CustomPainter {
       );
       canvas.drawRect(r, stroke);
 
-      // ラベル + スコア
       final tp = TextPainter(
         text: TextSpan(
           text:
               '${kJaName[d.label] ?? d.label} ${(d.score * 100).toStringAsFixed(0)}%',
-          style: const TextStyle(color: Color(0xFFFFFFFF), fontSize: 12),
+          style: const TextStyle(color: Colors.white, fontSize: 12),
         ),
         textDirection: TextDirection.ltr,
       )..layout();
 
-      final bg = Rect.fromLTWH(
-        r.left,
-        (r.top - tp.height - 2).clamp(0, size.height - tp.height).toDouble(),
-        tp.width + 6,
-        tp.height + 2,
-      );
+      final topY =
+          (r.top - tp.height - 2).clamp(0, size.height - tp.height).toDouble();
+      final bg = Rect.fromLTWH(r.left, topY, tp.width + 6, tp.height + 2);
       canvas.drawRect(bg, fill);
       tp.paint(canvas, Offset(bg.left + 3, bg.top + 1));
     }
   }
 
   @override
-  bool shouldRepaint(covariant _BoxPainter old) =>
-      old.dets != dets || old.srcSize != srcSize;
+  bool shouldRepaint(covariant _BoxPainter old) {
+    if (old.srcSize != srcSize) return true;
+    if (old.dets.length != dets.length) return true;
+    for (int i = 0; i < dets.length; i++) {
+      if (old.dets[i] != dets[i]) return true;
+    }
+    return false;
+  }
 }
 
+/// カメラ + 推論 + 音声
 class _MacCameraPage extends StatefulWidget {
   const _MacCameraPage({super.key});
   @override
@@ -174,32 +155,29 @@ class _MacCameraPage extends StatefulWidget {
 class _MacCameraPageState extends State<_MacCameraPage> {
   final YoloService _yolo = YoloService();
   final FlutterTts _tts = FlutterTts();
-
   CameraMacOSController? _ctrl;
 
-  // 推論スロットリング
   bool _inferBusy = false;
   DateTime _lastInferAt = DateTime.fromMillisecondsSinceEpoch(0);
+  int _inferIntervalMs = kInferEveryMsInit;
+  int _avgInferMs = kInferEveryMsInit;
 
-  // UI
   int _warmupLeft = kWarmupFrames;
   int _noHitFrames = 0;
   bool _hasDetection = false;
-  List<String> _topLabels = [];
+  List<String> _topLabels = const [];
 
-  // ボックス描画用
   List<YoloDetection> _boxes = const [];
   int _srcW = 0, _srcH = 0;
 
-  // TTS（キュー廃止：いま読んでいる1件だけ持つ）
   bool _speaking = false;
-  String? _speakingLabel; // 下部に出す固定ラベル（読了まで固定）
+  String? _speakingLabel;
 
-  // fps/HUD
   double _fps = 0;
   int _framesSeen = 0, _framesSeenLast = 0;
   DateTime _lastFpsAt = DateTime.now();
   String _debugInfo = 'YOLO init…';
+  DateTime _lastHudAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
@@ -213,14 +191,13 @@ class _MacCameraPageState extends State<_MacCameraPage> {
     await _tts.setVolume(1.0);
     await _tts.setPitch(1.0);
 
-    // 読み終わったら、直後の“現在の検出”からまた1件選ぶ
     _tts.setCompletionHandler(() {
       _speaking = false;
       if (!mounted) return;
-      setState(() => _speakingLabel = null); // 一旦消す
-      _maybeStartSpeaking(); // 次を即選択（無ければ何もしない）
+      setState(() => _speakingLabel = null);
+      _maybeStartSpeaking();
     });
-    _tts.setErrorHandler((msg) {
+    _tts.setErrorHandler((_) {
       _speaking = false;
       if (mounted) setState(() => _speakingLabel = null);
     });
@@ -230,15 +207,15 @@ class _MacCameraPageState extends State<_MacCameraPage> {
     });
 
     await _yolo.loadModel();
+    if (!mounted) return;
     setState(() => _debugInfo = _yolo.modelInfo());
   }
 
-  // ARGB8888 -> RGB（bytesPerRow対応）: 低コスト・コピーのみ
+  /// ARGB8888 → RGB
   Uint8List _bytesToRgb(Uint8List src, int w, int h, {int? bytesPerRow}) {
     final out = Uint8List(w * h * 3);
     final stride = bytesPerRow ?? (w * 4);
 
-    // 並び推定（軽く）
     int redBGRA = 0, redARGB = 0;
     final sample = math.min(64, (h * w));
     for (int s = 0; s < sample; s++) {
@@ -269,68 +246,73 @@ class _MacCameraPageState extends State<_MacCameraPage> {
     return out;
   }
 
-  // 「今の検出から1件選ぶ」: スコア最大を採用（閾値未満なら null）
   String? _pickCurrentLabel() {
     if (_yolo.lastTop.isEmpty) return null;
-    final hit = _yolo.lastTop.firstWhere(
+    final best = _yolo.lastTop.firstWhere(
       (e) => e.value >= kScoreThreshold,
       orElse: () => const MapEntry<String, double>('', -1),
     );
-    return hit.value >= 0 ? hit.key : null;
+    return best.value >= 0 ? best.key : null;
   }
 
   Future<void> _maybeStartSpeaking() async {
-    if (_speaking) return; // 読み終わるまでは新規開始しない
+    if (_speaking) return;
     final cand = _pickCurrentLabel();
     if (cand == null) return;
 
     _speaking = true;
-    if (mounted) {
-      setState(() => _speakingLabel = cand); // 下部に固定表示
-    }
-
+    if (mounted) setState(() => _speakingLabel = cand);
     final text = kMeaning[cand] ?? cand;
+
     try {
       await _tts.stop();
-      await _tts.speak(text); // 完了時は completionHandler が呼ばれる
+      await _tts.speak(text);
     } catch (_) {
       _speaking = false;
       if (mounted) setState(() => _speakingLabel = null);
     }
   }
 
+  void _updateInferInterval(int lastInferMs) {
+    if (lastInferMs <= 0) return;
+    _avgInferMs = (_avgInferMs * 3 + lastInferMs) ~/ 4;
+    _inferIntervalMs = (_avgInferMs * 3) ~/ 2;
+    _inferIntervalMs = _inferIntervalMs.clamp(90, 220);
+  }
+
   Future<void> _processFrame(Uint8List rgbBytes, int width, int height) async {
     if (_warmupLeft > 0) {
       _warmupLeft--;
-      if (_warmupLeft == 0) {
+      if (_warmupLeft == 0 && mounted) {
         setState(() {
-          _topLabels = [];
+          _topLabels = const [];
           _hasDetection = false;
           _boxes = const [];
           _srcW = width;
           _srcH = height;
-          _speakingLabel = null; // 初期化
+          _speakingLabel = null;
         });
       }
       return;
     }
 
+    final sw = Stopwatch()..start();
     final results =
         _yolo.runFrame(rgbBytes, width, height, threshold: kScoreThreshold);
+    sw.stop();
+    _updateInferInterval(sw.elapsedMilliseconds);
 
-    // 上部ラベル（リアルタイム）
     final top3 = _yolo.lastTop
         .where((e) => e.value >= kScoreThreshold)
         .take(3)
         .map((e) => e.key)
         .toList();
 
-    // 未検出が続いたらUIをクリア（ただし発話中は下部はキープ）
     if (results.isEmpty) {
       _noHitFrames++;
       if (_noHitFrames >= kClearAfterNoHit) {
         _hasDetection = false;
-        _topLabels = [];
+        _topLabels = const [];
         if (!_speaking) _speakingLabel = null;
       }
     } else {
@@ -339,16 +321,23 @@ class _MacCameraPageState extends State<_MacCameraPage> {
     }
 
     if (!mounted) return;
+
+    final now = DateTime.now();
+    final shouldUpdateHud =
+        kShowDebugHud && now.difference(_lastHudAt).inMilliseconds >= 500;
+    if (shouldUpdateHud) _lastHudAt = now;
+
     setState(() {
       _boxes = _yolo.lastDetections;
       _srcW = width;
       _srcH = height;
       _topLabels = top3;
-      _debugInfo = 'fps=${_fps.toStringAsFixed(1)} | ${_yolo.modelInfo()}\n'
-          '${_yolo.lastDebugLine}';
+      if (shouldUpdateHud) {
+        _debugInfo = 'fps=${_fps.toStringAsFixed(1)} | ${_yolo.modelInfo()}\n'
+            '${_yolo.lastDebugLine}';
+      }
     });
 
-    // 発話は「読み終わるまで開始しない」。空いたら今の検出から1件だけ読む
     _maybeStartSpeaking();
   }
 
@@ -376,13 +365,13 @@ class _MacCameraPageState extends State<_MacCameraPage> {
               spacing: 6,
               runSpacing: 6,
               children: _topLabels
+                  .take(3)
                   .map((k) => Chip(label: Text(kJaName[k] ?? k)))
                   .toList(),
             ),
           )
         : const SizedBox.shrink();
 
-    // 下部カードは「現在読み上げ中の1件」を固定表示
     final bottom = _speakingLabel != null
         ? Positioned(
             left: 24,
@@ -393,22 +382,14 @@ class _MacCameraPageState extends State<_MacCameraPage> {
               decoration: BoxDecoration(
                 color: Colors.white,
                 borderRadius: BorderRadius.circular(8),
-                boxShadow: const [
-                  BoxShadow(
-                    blurRadius: 6,
-                    color: Colors.black26,
-                    offset: Offset(0, 2),
-                  ),
-                ],
               ),
               child: Text(
                 kMeaning[_speakingLabel!] ?? _speakingLabel!,
                 textAlign: TextAlign.center,
                 style: const TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.red,
-                ),
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.red),
               ),
             ),
           )
@@ -419,7 +400,7 @@ class _MacCameraPageState extends State<_MacCameraPage> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // 1) カメラプレビュー
+          // カメラプレビュー
           Positioned.fill(
             child: CameraMacOSView(
               key: const ValueKey('macCamera'),
@@ -428,14 +409,13 @@ class _MacCameraPageState extends State<_MacCameraPage> {
               onCameraInizialized: (controller) async {
                 _ctrl = controller;
                 await _ctrl!.startImageStream((imageData) async {
-                  // プレビューは常時描画 → fpsだけ更新
                   final now = DateTime.now();
                   _updateFps(now);
 
-                  // 推論を間引く（最新だけ処理）
+                  final tooSoon = now.difference(_lastInferAt).inMilliseconds <
+                      _inferIntervalMs;
                   if (_inferBusy ||
-                      now.difference(_lastInferAt).inMilliseconds <
-                          kInferEveryMs ||
+                      tooSoon ||
                       !_yolo.isReady ||
                       imageData == null) {
                     return;
@@ -444,13 +424,14 @@ class _MacCameraPageState extends State<_MacCameraPage> {
                   _lastInferAt = now;
 
                   try {
-                    final Uint8List? bytes = imageData.bytes;
-                    final int? w = imageData.width;
-                    final int? h = imageData.height;
-                    final int? bpr = (imageData.bytesPerRow is int)
-                        ? imageData.bytesPerRow as int
-                        : null;
+                    final bytes = imageData.bytes;
+                    final w = imageData.width;
+                    final h = imageData.height;
                     if (bytes == null || w == null || h == null) return;
+
+                    int? bpr;
+                    final v = imageData.bytesPerRow;
+                    if (v is int) bpr = v;
 
                     final rgb = _bytesToRgb(bytes, w, h, bytesPerRow: bpr);
                     await _processFrame(rgb, w, h);
@@ -462,21 +443,21 @@ class _MacCameraPageState extends State<_MacCameraPage> {
             ),
           ),
 
-          // 2) 赤枠オーバーレイ
+          // 検出ボックス
           if (_srcW > 0 && _srcH > 0)
             Positioned.fill(
-              child: IgnorePointer(
-                ignoring: true,
-                child: CustomPaint(
-                  painter: _BoxPainter(
-                    _boxes,
-                    Size(_srcW.toDouble(), _srcH.toDouble()),
+              child: RepaintBoundary(
+                child: IgnorePointer(
+                  ignoring: true,
+                  child: CustomPaint(
+                    painter: _BoxPainter(
+                        _boxes, Size(_srcW.toDouble(), _srcH.toDouble())),
                   ),
                 ),
               ),
             ),
 
-          // 3) HUD / チップ / ガイダンス
+          // 上部ラベル / 下部ラベル / 右上デバック
           SafeArea(
             child: Stack(
               children: [
@@ -488,9 +469,7 @@ class _MacCameraPageState extends State<_MacCameraPage> {
                     right: 8,
                     child: Container(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 6,
-                      ),
+                          horizontal: 8, vertical: 6),
                       color: Colors.black54,
                       child: Text(
                         _debugInfo,
@@ -509,8 +488,15 @@ class _MacCameraPageState extends State<_MacCameraPage> {
 
   @override
   void dispose() {
-    _ctrl?.stopImageStream();
-    _tts.stop();
+    try {
+      _ctrl?.stopImageStream();
+    } catch (_) {}
+    try {
+      _ctrl?.destroy();
+    } catch (_) {}
+    try {
+      _tts.stop();
+    } catch (_) {}
     super.dispose();
   }
 }

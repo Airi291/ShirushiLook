@@ -15,7 +15,6 @@ void main() {
 
 class OfflineTestPage extends StatefulWidget {
   const OfflineTestPage({super.key});
-
   @override
   State<OfflineTestPage> createState() => _OfflineTestPageState();
 }
@@ -23,11 +22,9 @@ class OfflineTestPage extends StatefulWidget {
 class _OfflineTestPageState extends State<OfflineTestPage> {
   final YoloService _yolo = YoloService();
 
-  // AssetManifest.json から自動収集
   List<String> _assets = [];
-
   bool _ready = false;
-  String _log = 'モデル準備中...';
+  String _log = 'モデル準備中';
   Image? _preview;
 
   @override
@@ -36,27 +33,17 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
     _init();
   }
 
+  /// モデル初期化 + assets/study/ の画像を収集
   Future<void> _init() async {
     try {
-      // 1) モデル初期化
       await _yolo.loadModel();
 
-      // 2) assets/study/配下の画像パスを全部拾う
       final manifestRaw = await rootBundle.loadString('AssetManifest.json');
       final Map<String, dynamic> manifest = json.decode(manifestRaw);
-      final allowedExt = [
-        '.jpg',
-        '.JPG',
-        '.jpeg',
-        '.png',
-        '.webp',
-        '.avif',
-      ];
 
+      const exts = ['.jpg', '.JPG', '.jpeg', '.png', '.webp', '.avif'];
       final all = manifest.keys
-          .where((p) =>
-              p.startsWith('assets/study/') &&
-              allowedExt.any((ext) => p.endsWith(ext)))
+          .where((p) => p.startsWith('assets/study/') && exts.any(p.endsWith))
           .toList()
         ..sort();
 
@@ -73,30 +60,28 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
     }
   }
 
+  /// 1枚のアセット画像で推論
   Future<void> _runOnAsset(String assetPath) async {
     setState(() {
-      // プレビュー（Avif 等で表示できない場合は後でログに出す）
       _preview = Image.asset(assetPath, fit: BoxFit.contain);
-      _log = '推論中...';
+      _log = '推論中';
     });
 
     try {
       final data = await rootBundle.load(assetPath);
       final bytes = data.buffer.asUint8List();
-
       final decoded = img.decodeImage(bytes);
       if (decoded == null) {
-        setState(() => _log = '画像デコードに失敗: $assetPath');
+        setState(() => _log = '画像読み込みに失敗: $assetPath');
         return;
       }
 
-      // RGBに詰め直し（← ここが型エラー箇所だったので厳密にintへ）
+      // RGBへ詰め直し（0–255に丸めてUint8Listへ）
       final rgb = Uint8List(decoded.width * decoded.height * 3);
       int i = 0;
       for (var y = 0; y < decoded.height; y++) {
         for (var x = 0; x < decoded.width; x++) {
           final p = decoded.getPixel(x, y);
-          // p.r/g/b は num の場合があるので 0–255 に clamp して int へ
           rgb[i++] = (p.r as num).clamp(0, 255).toInt();
           rgb[i++] = (p.g as num).clamp(0, 255).toInt();
           rgb[i++] = (p.b as num).clamp(0, 255).toInt();
@@ -107,7 +92,7 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
         rgb,
         decoded.width,
         decoded.height,
-        threshold: 0.30, // テストなので少し緩め
+        threshold: 0.30,
       );
 
       final top = _yolo.lastTop
@@ -138,11 +123,10 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('YOLO Offline Test (macOS)'),
+        title: const Text('YOLO Offline Test'),
         actions: [
           if (_assets.isNotEmpty)
             IconButton(
-              tooltip: 'すべて順番に試す',
               icon: const Icon(Icons.playlist_play),
               onPressed: () async {
                 for (final a in _assets) {
@@ -155,13 +139,15 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
       ),
       body: Column(
         children: [
+          // プレビュー
           Expanded(
             child: Center(
-              child: _preview ?? const Text('下の一覧から画像を選んでください'),
+              child: _preview ?? const Text('画像選択'),
             ),
           ),
           const Divider(height: 1),
-          // 横スクロールで全画像を出す
+
+          // サムネ一覧
           SizedBox(
             height: 160,
             child: ListView.builder(
@@ -206,6 +192,8 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
             ),
           ),
           const Divider(height: 1),
+
+          // ログ
           Padding(
             padding: const EdgeInsets.all(12),
             child: SelectableText(
