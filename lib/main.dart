@@ -2,23 +2,21 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'dart:io' show Platform;
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
-// macOS カメラ（camera_macos ^0.0.9 想定）
 import 'package:camera_macos/camera_macos_controller.dart';
 import 'package:camera_macos/camera_macos_view.dart';
 import 'package:camera_macos/camera_macos.dart' show CameraMacOSMode;
 
 import 'yolo.dart';
-import 'dart:math' as math;
 
-/// ====== 表示名・読み上げ文言 ======
 const Map<String, String> kJaName = {
   'stop': '一時停止',
-  'yield': 'ゆずれ',
+  'yield': '一時停止',
   'no_entry': '進入禁止',
   'speed_limit': '速度制限',
   'pedestrian_crossing': '横断歩道',
@@ -42,7 +40,7 @@ const Map<String, String> kJaName = {
 
 const Map<String, String> kMeaning = {
   'stop': 'ここで必ず一時停止してください。',
-  'yield': '対向・優先車に道を譲ってください。',
+  'yield': 'ここで必ず一時停止してください。',
   'no_entry': 'この先は進入できません。',
   'speed_limit': '標識の制限速度を守ってください。',
   'pedestrian_crossing': '横断歩道。歩行者に十分注意。',
@@ -64,11 +62,13 @@ const Map<String, String> kMeaning = {
   'parking': '駐車できます。周囲安全を確認。',
 };
 
-/// ====== チューニング用定数 ======
-const int kWarmupFrames = 12;
+const int kWarmupFrames = 8; // ウォームアップを少し短縮
 const int kStreakNeed = 2;
 const int kClearAfterNoHit = 3;
 const double kScoreThreshold = 0.65;
+
+// ★ 推論を間引く（ms）
+const int kInferEveryMs = 120; // 約8fps程度で推論（プレビューは常時）
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -94,25 +94,17 @@ class _Entry extends StatelessWidget {
   const _Entry({super.key});
   @override
   Widget build(BuildContext context) {
-    if (Platform.isMacOS) {
-      return const _MacCameraPage();
-    }
-    // macOS以外では簡易メッセージのみ（iOS/Android 実装は今回は省略）
+    if (Platform.isMacOS) return const _MacCameraPage();
     return const Scaffold(
       backgroundColor: Colors.black,
       body: Center(
-        child: Text(
-          'このビルドは macOS 専用です（iOS/Android ページは未同梱）',
-          style: TextStyle(color: Colors.white70),
-        ),
+        child:
+            Text('このビルドは macOS 専用です', style: TextStyle(color: Colors.white70)),
       ),
     );
   }
 }
 
-/// =====================
-/// macOS カメラ + YOLO
-/// =====================
 class _MacCameraPage extends StatefulWidget {
   const _MacCameraPage({super.key});
   @override
@@ -124,9 +116,12 @@ class _MacCameraPageState extends State<_MacCameraPage> {
   final FlutterTts _tts = FlutterTts();
 
   CameraMacOSController? _ctrl;
-  bool _busy = false;
 
-  // 安定化・UI 状態
+  // 推論のスロットリング
+  bool _inferBusy = false;
+  DateTime _lastInferAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // 安定化・UI
   int _warmupLeft = kWarmupFrames;
   int _noHitFrames = 0;
   final Map<String, int> _streak = {};
@@ -157,45 +152,22 @@ class _MacCameraPageState extends State<_MacCameraPage> {
     await _tts.setSpeechRate(0.5);
     await _tts.setVolume(1.0);
     await _tts.setPitch(1.0);
-
     await _yolo.loadModel();
     setState(() => _debugInfo = _yolo.modelInfo());
   }
 
-// ARGB→RGBの後に使う：RGBを時計回り90°回転
-  Uint8List rotateRgbCW90(Uint8List src, int w, int h) {
-    // 出力は (幅=h, 高さ=w) だが画素数は同じなのでサイズは w*h*3 のままでOK
-    final out = Uint8List(w * h * 3);
-    int di = 0;
-
-    // 目的座標 (x', y') に対し、元座標は (sx, sy) = (y', h - 1 - x')
-    for (int yOut = 0; yOut < w; yOut++) {
-      // 出力の高さ = w
-      for (int xOut = 0; xOut < h; xOut++) {
-        // 出力の幅   = h
-        final int sx = yOut;
-        final int sy = h - 1 - xOut;
-        final int si = (sy * w + sx) * 3;
-        out[di++] = src[si];
-        out[di++] = src[si + 1];
-        out[di++] = src[si + 2];
-      }
-    }
-    return out;
-  }
-
-  // ARGB8888 -> RGB
+  // ARGB8888 -> RGB（bytesPerRow対応）: 低コスト・コピーのみ
   Uint8List _bytesToRgb(Uint8List src, int w, int h, {int? bytesPerRow}) {
     final out = Uint8List(w * h * 3);
     final stride = bytesPerRow ?? (w * 4);
 
-    // 並び推定（数十pixelだけ見て赤チャンネル位置を推測）
+    // 並び推定（軽く）
     int redBGRA = 0, redARGB = 0;
     final sample = math.min(64, (h * w));
     for (int s = 0; s < sample; s++) {
       final i = (s ~/ w) * stride + (s % w) * 4;
-      redBGRA += src[i + 2]; // BGRA の R
-      redARGB += src[i + 1]; // ARGB の R
+      redBGRA += src[i + 2];
+      redARGB += src[i + 1];
     }
     final isBGRA = redBGRA >= redARGB;
 
@@ -247,11 +219,9 @@ class _MacCameraPageState extends State<_MacCameraPage> {
       _noHitFrames++;
       _streak.updateAll((_, v) => v > 0 ? v - 1 : 0);
       if (_noHitFrames >= kClearAfterNoHit) {
-        setState(() {
-          _hasDetection = false;
-          _topLabels = [];
-          _bottomLabel = null;
-        });
+        _hasDetection = false;
+        _topLabels = [];
+        _bottomLabel = null;
       }
     } else {
       _noHitFrames = 0;
@@ -262,14 +232,13 @@ class _MacCameraPageState extends State<_MacCameraPage> {
       for (final k in _streak.keys.toList()) {
         if (!results.contains(k)) {
           final v = _streak[k]! - 1;
-          if (v <= 0) {
+          if (v <= 0)
             _streak.remove(k);
-          } else {
+          else
             _streak[k] = v;
-          }
         }
       }
-      _hasDetection = results.isNotEmpty;
+      _hasDetection = true;
     }
 
     if (!mounted) return;
@@ -317,8 +286,22 @@ class _MacCameraPageState extends State<_MacCameraPage> {
     }
   }
 
+  void _updateFps(DateTime now) {
+    _framesSeen++;
+    final ms = now.difference(_lastFpsAt).inMilliseconds;
+    if (ms >= 1000) {
+      setState(() {
+        _fps = (_framesSeen - _framesSeenLast) / (ms / 1000.0);
+        _framesSeenLast = _framesSeen;
+        _lastFpsAt = now;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    const bool kShowDebugHud = false; // 右上のラベルを出すか
+    const bool kShowChips = true; // 上部の検出チップを出すか
     final chips = _hasDetection && _topLabels.isNotEmpty
         ? Positioned(
             top: 12,
@@ -369,65 +352,71 @@ class _MacCameraPageState extends State<_MacCameraPage> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // CameraMacOSView：初期化時に controller を受け取り、画像ストリーム開始
           CameraMacOSView(
-              key: const ValueKey('macCamera'),
-              cameraMode: CameraMacOSMode.video,
-              fit: BoxFit.cover,
-              onCameraInizialized: (controller) async {
-                _ctrl = controller;
+            key: const ValueKey('macCamera'),
+            cameraMode: CameraMacOSMode.video,
+            fit: BoxFit.cover,
+            onCameraInizialized: (controller) async {
+              _ctrl = controller;
 
-                await _ctrl!.startImageStream((imageData) async {
-                  // まず imageData 自体の null を弾く
-                  final data = imageData;
-                  if (_busy || !_yolo.isReady || data == null) return;
+              await _ctrl!.startImageStream((imageData) async {
+                // プレビューは常時描画 → fpsだけ更新
+                final now = DateTime.now();
+                _updateFps(now);
 
-                  // ここで全部取り出して null チェック
-                  final Uint8List? bytes = data.bytes;
-                  final int? w = data.width;
-                  final int? h = data.height;
-                  // プラグインに bytesPerRow があれば使う（無ければ null でOK）
-                  final int? bpr = (data.bytesPerRow is int)
-                      ? data.bytesPerRow as int
+                // 推論のスロットリング：最新フレームのみ処理
+                if (_inferBusy ||
+                    now.difference(_lastInferAt).inMilliseconds <
+                        kInferEveryMs ||
+                    !_yolo.isReady ||
+                    imageData == null) {
+                  return;
+                }
+                _inferBusy = true;
+                _lastInferAt = now;
+
+                try {
+                  final Uint8List? bytes = imageData.bytes;
+                  final int? w = imageData.width;
+                  final int? h = imageData.height;
+                  final int? bpr = (imageData.bytesPerRow is int)
+                      ? imageData.bytesPerRow as int
                       : null;
-
                   if (bytes == null || w == null || h == null) return;
 
-                  _busy = true;
-                  try {
-                    final rgb = _bytesToRgb(bytes, w, h, bytesPerRow: bpr);
-                    var results =
-                        _yolo.runFrame(rgb, w, h, threshold: kScoreThreshold);
-                    if (results.isEmpty) {
-                      final rgb90 = rotateRgbCW90(rgb, w, h);
-                      results = _yolo.runFrame(rgb90, h, w,
-                          threshold: kScoreThreshold);
-                    }
-                    await _processFrame(rgb, w, h);
-                    // …FPS計測はそのまま…
-                  } finally {
-                    _busy = false;
-                  }
-                });
-              }),
+                  final rgb = _bytesToRgb(bytes, w, h, bytesPerRow: bpr);
+                  await _processFrame(rgb, w, h);
+                } finally {
+                  _inferBusy = false;
+                }
+              });
+            },
+          ), // 上部の検出チップを出すか
           SafeArea(
             child: Stack(
               children: [
-                chips,
+                // 検出チップ
+                if (kShowChips) chips,
+
+                // 下のガイダンス
                 bottom,
-                Positioned(
-                  top: 8,
-                  right: 8,
-                  child: Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                    color: Colors.black54,
-                    child: Text(
-                      _debugInfo,
-                      style: const TextStyle(color: Colors.white, fontSize: 12),
+
+                // 右上のデバッグHUD
+                if (kShowDebugHud)
+                  Positioned(
+                    top: 8,
+                    right: 8,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 6),
+                      color: Colors.black54,
+                      child: Text(
+                        _debugInfo,
+                        style:
+                            const TextStyle(color: Colors.white, fontSize: 12),
+                      ),
                     ),
                   ),
-                ),
               ],
             ),
           ),
@@ -439,7 +428,6 @@ class _MacCameraPageState extends State<_MacCameraPage> {
   @override
   void dispose() {
     _ctrl?.stopImageStream();
-    // 一部バージョンには dispose() が無いので呼ばない
     _tts.stop();
     super.dispose();
   }
